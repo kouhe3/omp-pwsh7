@@ -305,16 +305,8 @@ export class PwshSessionPool {
 		return session;
 	}
 
-	/** True when the key has a live session that is not busy. */
-	hasIdle(key: string): boolean {
-		const s = this.#sessions.get(key);
-		return s !== undefined && !s.dead && !s.busy;
-	}
-
 	disposeAll(): void {
 		for (const s of this.#sessions.values()) void s.dispose();
 		this.#sessions.clear();
 	}
 }
-
-export { runnerScriptPath, resolvePwshExecutable };

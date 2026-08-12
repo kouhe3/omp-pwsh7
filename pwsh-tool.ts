@@ -15,7 +15,6 @@ const MAX_TIMEOUT_SEC = 3600;
 const DEFAULT_WIDTH = 200;
 const MIN_WIDTH = 40;
 const MAX_WIDTH = 4096;
-const DEFAULT_JSON_DEPTH = 8;
 const MAX_INLINE_OUTPUT_CHARS = 12_000;
 
 export interface PwshParams {
@@ -445,10 +444,6 @@ function frameTitle(theme: Theme, cwd?: string, extra?: string): string {
 const PREVIEW_LINES_COLLAPSED = 6;
 const PREVIEW_LINES_EXPANDED = 20;
 
-function clip(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
 interface PwshRenderResult {
 	details?: PwshDetails;
 	isError?: boolean;
@@ -471,6 +466,30 @@ function renderStatusLabel(d: PwshDetails, isError: boolean, theme: Theme): stri
 	return `${theme.fg(color, icon)} ${state}${exitText} · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
 }
 
+/**
+ * Command block rows: titled frame with up to 4 highlighted command lines.
+ * Shared by renderCall and renderResult (pending + merged frames).
+ */
+function commandBlock(
+	theme: Theme,
+	width: number,
+	command: string,
+	cwd: string | undefined,
+	running: boolean,
+): string[] {
+	const title = frameTitle(theme, cwd, running ? " · executing…" : "");
+	const out: string[] = [frameTop(width, theme, title)];
+	let highlighted: string[];
+	try {
+		highlighted = highlightPowerShell(command, theme).slice(0, 4);
+	} catch {
+		highlighted = command.split("\n").slice(0, 4);
+	}
+	for (const l of highlighted) out.push(frameRow(l, width, theme));
+	out.push(frameBottom(width, theme));
+	return out;
+}
+
 function renderBody(d: PwshDetails, expanded: boolean, theme: Theme): string[] {
 	// Normalize CRLF: pwsh emits \r\n frames that would make the terminal
 	// cursor jump back to line start (blank-looking rows).
@@ -490,8 +509,7 @@ function renderBody(d: PwshDetails, expanded: boolean, theme: Theme): string[] {
 		prevBlank = blank;
 		bodyLines.push(l);
 	}
-	const lines: string[] = [];
-	for (const l of bodyLines.slice(0, maxLines)) lines.push(l);
+	const lines = bodyLines.slice(0, maxLines);
 	if (bodyLines.length > maxLines) {
 		lines.push(theme.fg("dim", `… ${bodyLines.length - maxLines} more lines (ctrl+o to expand)`));
 	}
@@ -539,22 +557,9 @@ export function definePwshTool(pi: ExtensionAPI) {
 			}
 		},
 		renderCall(args: PwshParams, options: PwshRenderOptions, theme: Theme) {
-			const command = args.command;
-			const running = options.spinnerFrame !== undefined;
 			return {
-				render: (width: number) => {
-					const title = frameTitle(theme, args.cwd, running ? " · executing…" : "");
-					let highlighted: string[];
-					try {
-						highlighted = highlightPowerShell(command ?? "", theme).slice(0, 4);
-					} catch {
-						highlighted = (command ?? "").split("\n").slice(0, 4);
-					}
-					const out: string[] = [frameTop(width, theme, title)];
-					for (const l of highlighted) out.push(frameRow(l, width, theme));
-					out.push(frameBottom(width, theme));
-					return out;
-				},
+				render: (width: number) =>
+					commandBlock(theme, width, args.command ?? "", args.cwd, options.spinnerFrame !== undefined),
 			};
 		},
 		renderResult(
@@ -567,40 +572,20 @@ export function definePwshTool(pi: ExtensionAPI) {
 			if (!d) {
 				// Partial/pending result (onUpdate fired, no details yet): keep the
 				// command block visible instead of an empty frame.
-				const running = options.spinnerFrame !== undefined;
 				return {
-					render: (width: number) => {
-						const title = frameTitle(theme, args?.cwd, running ? " · executing…" : "");
-						const out: string[] = [frameTop(width, theme, title)];
-						try {
-							for (const l of highlightPowerShell(args?.command ?? "", theme).slice(0, 4)) {
-								out.push(frameRow(l, width, theme));
-							}
-						} catch {
-							for (const l of (args?.command ?? "").split("\n").slice(0, 4)) {
-								out.push(frameRow(l, width, theme));
-							}
-						}
-						out.push(frameBottom(width, theme));
-						return out;
-					},
+					render: (width: number) =>
+						commandBlock(theme, width, args?.command ?? "", args?.cwd, options.spinnerFrame !== undefined),
 				};
 			}
 			const expanded = options.expanded === true;
-			const title = frameTitle(theme, d.cwd);
 			const statusLabel = renderStatusLabel(d, result.isError === true, theme);
-			const command = args?.command ?? "";
 			const bodyLines = renderBody(d, expanded, theme);
 			return {
 				render: (width: number) => {
-					const divider = frameDivider(width, theme, statusLabel);
-					const out: string[] = [frameTop(width, theme, title)];
 					// Command block (merged frame, like built-in tools)
-					for (const l of highlightPowerShell(command, theme).slice(0, 4)) {
-						out.push(frameRow(l, width, theme));
-					}
+					const out = commandBlock(theme, width, args?.command ?? "", d.cwd, false);
 					// Status + timing divider
-					out.push(divider);
+					out.push(frameDivider(width, theme, statusLabel));
 					// Output rows
 					for (const l of bodyLines) out.push(frameRow(l, width, theme));
 					if (expanded && d.dead) {
