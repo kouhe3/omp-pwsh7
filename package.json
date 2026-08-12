@@ -1,0 +1,8 @@
+{
+  "name": "omp-pwsh7",
+  "version": "1.0.0",
+  "description": "Persistent PowerShell 7 session tool for OMP",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT"
+}
