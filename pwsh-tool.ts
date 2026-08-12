@@ -15,7 +15,6 @@ const MAX_TIMEOUT_SEC = 3600;
 const DEFAULT_WIDTH = 200;
 const MIN_WIDTH = 40;
 const MAX_WIDTH = 4096;
-const MAX_INLINE_OUTPUT_CHARS = 12_000;
 
 export interface PwshParams {
 	command: string;
@@ -38,7 +37,6 @@ export interface PwshDetails {
 	error?: string | null;
 	output?: string | null;
 	wallTimeMs: number;
-	truncated: boolean;
 }
 
 interface SessionLike {
@@ -109,7 +107,6 @@ export async function runPwsh(
 		format,
 		timeoutSec,
 		wallTimeMs,
-		truncated: false,
 	};
 
 	if (runResult.busy) {
@@ -152,18 +149,16 @@ export async function runPwsh(
 	details.error = resp?.error ?? null;
 	details.output = resp?.output ?? null;
 
-	// Cap what the model sees. The full output stays in details for the TUI
-	// preview; only the LLM-facing text is truncated. Trailing blank lines from
-	// Out-String are trimmed so the wire text stays compact.
+	// Full output passes through untruncated: the host's wrapToolWithMetaNotice
+	// spill (tools.artifactSpillThreshold, default 50 KB) saves oversized
+	// results to an artifact and appends `Read artifact://N for full output`,
+	// so nothing is lost. Trailing blank lines from Out-String are trimmed so
+	// the wire text stays compact.
 	let body: string;
 	if (resp?.error) {
 		body = `Execution error: ${resp.error}`;
 	} else if (resp?.output) {
 		body = resp.output.replace(/\r\n/g, "\n").replace(/\r/g, "").trimEnd();
-		if (body.length > MAX_INLINE_OUTPUT_CHARS) {
-			details.truncated = true;
-			body = `${body.slice(0, MAX_INLINE_OUTPUT_CHARS)}… (truncated ${body.length - MAX_INLINE_OUTPUT_CHARS} chars)`;
-		}
 	} else {
 		body = "(no output)";
 	}
@@ -187,7 +182,6 @@ function emptyDetails(params: PwshParams, cwd: string, error: string): PwshDetai
 		timeoutSec: normalizeTimeout(params.timeout),
 		error,
 		wallTimeMs: 0,
-		truncated: false,
 	};
 }
 
