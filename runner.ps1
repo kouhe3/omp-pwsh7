@@ -40,14 +40,12 @@ while ($true) {
 
     if ($null -eq $req -or $null -eq $req.id) { continue }
 
-    # Apply per-request env vars; remove them afterwards so the session is not polluted.
+    # Per-request env vars. Keys are validated against a strict identifier
+    # pattern: the Env: drive supports wildcard paths (e.g. `F*` would match
+    # every F* variable), so unvalidated keys could tamper with more than the
+    # caller asked for. Reject invalid keys (command does not run) and restore
+    # afterwards so the session is not polluted.
     $envKeys = @()
-    if ($req.env -and $req.env.PSObject.Properties.Count -gt 0) {
-        foreach ($prop in $req.env.PSObject.Properties) {
-            $envKeys += $prop.Name
-            Set-Item -Path ("Env:" + $prop.Name) -Value ([string]$prop.Value)
-        }
-    }
 
     $width = $DEFAULT_WIDTH
     if ($req.width -and $req.width -ge 40 -and $req.width -le 4096) { $width = [int]$req.width }
@@ -55,6 +53,16 @@ while ($true) {
     $output = $null
     $errorText = $null
     try {
+        if ($req.env -and $req.env.PSObject.Properties.Count -gt 0) {
+            foreach ($prop in $req.env.PSObject.Properties) {
+                if ($prop.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+                    throw "invalid env key: $($prop.Name)"
+                }
+                $envKeys += $prop.Name
+                Set-Item -Path ("Env:" + $prop.Name) -Value ([string]$prop.Value)
+            }
+        }
+
         $global:LASTEXITCODE = $null  # clear stale native exit code from prior requests
         $captured = . ([scriptblock]::Create([string]$req.code)) 2>&1
         if ($req.format -eq 'json') {

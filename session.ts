@@ -67,7 +67,13 @@ export class PwshSession {
 	#dead = false;
 	#buffer = "";
 	#pending = new Map<number, { resolve: (r: PwshResponse) => void; reject: (e: Error) => void }>();
-	#nextId = 1;
+	/**
+	 * Sequence start is randomized so an in-session script cannot enumerate
+	 * upcoming request ids and forge protocol responses (a crafted stdout line
+	 * `base64(JSON { id, output })` would otherwise resolve the pending request
+	 * with attacker-controlled content).
+	 */
+	#nextId = 1 + ((Math.random() * 0x7ffffffe) | 0);
 	#inFlight = false;
 	#lastError: string | undefined;
 	#stderrTail = "";
