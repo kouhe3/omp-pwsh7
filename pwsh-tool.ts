@@ -460,6 +460,8 @@ function renderStatusLabel(d: PwshDetails, isError: boolean, theme: Theme): stri
 /**
  * Command block rows: titled frame with up to 4 highlighted command lines.
  * Shared by renderCall and renderResult (pending + merged frames).
+ * `closed: false` leaves the frame open (no bottom bar) so a merged
+ * renderResult can follow with the status divider + output + single bottom.
  */
 function commandBlock(
 	theme: Theme,
@@ -467,6 +469,7 @@ function commandBlock(
 	command: string,
 	cwd: string | undefined,
 	running: boolean,
+	closed = true,
 ): string[] {
 	const title = frameTitle(theme, cwd, running ? " · executing…" : "");
 	const out: string[] = [frameTop(width, theme, title)];
@@ -477,7 +480,7 @@ function commandBlock(
 		highlighted = command.split("\n").slice(0, 4);
 	}
 	for (const l of highlighted) out.push(frameRow(l, width, theme));
-	out.push(frameBottom(width, theme));
+	if (closed) out.push(frameBottom(width, theme));
 	return out;
 }
 
@@ -573,8 +576,10 @@ export function definePwshTool(pi: ExtensionAPI) {
 			const bodyLines = renderBody(d, expanded, theme);
 			return {
 				render: (width: number) => {
-					// Command block (merged frame, like built-in tools)
-					const out = commandBlock(theme, width, args?.command ?? "", d.cwd, false);
+					// Command block (merged frame, like built-in tools) - left open
+					// so the status divider + output rows share one frame with a
+					// single bottom bar.
+					const out = commandBlock(theme, width, args?.command ?? "", d.cwd, false, false);
 					// Status + timing divider
 					out.push(frameDivider(width, theme, statusLabel));
 					// Output rows
