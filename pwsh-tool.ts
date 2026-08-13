@@ -5,7 +5,6 @@
  * State (variables, modules, location) survives across calls, so module
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
  */
-import * as fs from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { PwshSessionPool, type PwshRunResult } from "./session";
 
@@ -66,10 +65,8 @@ export async function runPwsh(
 
 	// Validate cwd before spawning so a bad path fails fast instead of
 	// producing a confusing spawn error.
-	let cwdStat: fs.Stats;
-	try {
-		cwdStat = await fs.promises.stat(cwd);
-	} catch {
+	const cwdStat = await Bun.file(cwd).stat().catch(() => null);
+	if (!cwdStat) {
 		return {
 			text: `Working directory does not exist: ${cwd}`,
 			details: emptyDetails(params, cwd, `Working directory does not exist: ${cwd}`),

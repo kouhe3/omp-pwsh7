@@ -3,10 +3,6 @@
  * line-based base64-JSON protocol. One process per session key; state
  * (variables, modules, cwd) survives across requests.
  */
-import { spawn, type ChildProcess } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 
 export interface PwshRequest {
 	id: number;
@@ -47,8 +43,7 @@ export interface PwshRunResult {
 /** Path to the runner script, cached on disk next to the extension. */
 function runnerScriptPath(): string {
 	// Resolve relative to this module: extensions/pwsh7/session.ts -> runner.ps1
-	const moduleDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
-	return path.join(moduleDir, "runner.ps1");
+	return `${import.meta.dir}/runner.ps1`;
 }
 
 function resolvePwshExecutable(envPath?: string): string {
@@ -60,13 +55,20 @@ const KILL_GRACE_MS = 1500;
 const BUSY_WAIT_TIMEOUT_MS = 30_000;
 /** Keep the last N chars of runner stderr for diagnostics. */
 const STDERR_TAIL_CHARS = 500;
+/** Handle returned by setTimeout; held per-request so it can be cleared on settle. */
+type TimerHandle = ReturnType<typeof setTimeout>;
 
 export class PwshSession {
 	readonly key: string;
-	#proc: ChildProcess | null = null;
+	#proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | null = null;
 	#dead = false;
 	#buffer = "";
 	#pending = new Map<number, { resolve: (r: PwshResponse) => void; reject: (e: Error) => void }>();
+	/** Per-request "process exited" subscribers (Bun has no event emitter on Subprocess). */
+	#exitHandlers = new Set<() => void>();
+	/** Persistent decoders: UTF-8 multibyte chars can straddle stream chunks. */
+	#stdoutDecoder = new TextDecoder();
+	#stderrDecoder = new TextDecoder();
 	/**
 	 * Sequence start is randomized so an in-session script cannot enumerate
 	 * upcoming request ids and forge protocol responses (a crafted stdout line
@@ -97,29 +99,78 @@ export class PwshSession {
 
 	/** Start the pwsh subprocess if not already running. */
 	start(): void {
-		if (this.#proc && !this.#proc.killed) return;
-		const proc = spawn(this.pwshPath, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", this.runnerPath], {
-			stdio: ["pipe", "pipe", "pipe"],
-			windowsHide: true,
-			cwd: this.cwd,
-		});
+		// #dead means the old proc was killed (timeout/abort) and is still
+		// dying via taskkill - respawn instead of treating it as alive.
+		if (this.#proc && !this.#dead && !this.#proc.killed) return;
+		let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+		try {
+			proc = Bun.spawn([this.pwshPath, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", this.runnerPath], {
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: true,
+				cwd: this.cwd,
+			});
+		} catch (err) {
+			// Spawn failure (e.g. pwsh missing) surfaces as a sync throw.
+			this.#dead = true;
+			this.#lastError = err instanceof Error ? err.message : String(err);
+			this.#rejectAll(err instanceof Error ? err : new Error(String(err)));
+			return;
+		}
 		this.#proc = proc;
 		this.#dead = false;
-		proc.stdout?.setEncoding("utf8");
-		proc.stderr?.setEncoding("utf8");
-		proc.stdout?.on("data", chunk => this.#onStdout(chunk as string));
-		proc.stderr?.on("data", chunk => {
-			this.#stderrTail = ((this.#stderrTail + String(chunk)).slice(-STDERR_TAIL_CHARS));
-		});
-		proc.on("exit", () => {
-			this.#dead = true;
-			this.#rejectAll(new Error("pwsh process exited"));
-		});
-		proc.on("error", err => {
-			this.#dead = true;
-			this.#lastError = err.message;
-			this.#rejectAll(err);
-		});
+		// Bun's onStdout/onStderr spawn options never fire (Bun 1.3.14,
+		// Windows) - read the piped streams manually instead.
+		if (proc.stdout) void this.#pipeStream(proc.stdout, chunk => this.#onStdout(this.#stdoutDecoder.decode(chunk, { stream: true })));
+		if (proc.stderr) {
+			void this.#pipeStream(proc.stderr, chunk => {
+				this.#stderrTail = (this.#stderrTail + this.#stderrDecoder.decode(chunk, { stream: true })).slice(-STDERR_TAIL_CHARS);
+			});
+		}
+		proc.exited.then(
+			() => {
+				if (this.#proc !== proc) return; // superseded by a respawned proc
+				this.#emitExit();
+				this.#dead = true;
+				this.#rejectAll(new Error("pwsh process exited"));
+			},
+			// Async spawn failure (no stdio pipes requested): `exited` rejects.
+			(err: unknown) => {
+				if (this.#proc !== proc) return; // superseded by a respawned proc
+				this.#emitExit();
+				this.#dead = true;
+				this.#lastError = err instanceof Error ? err.message : String(err);
+				this.#rejectAll(err instanceof Error ? err : new Error(String(err)));
+			},
+		);
+	}
+
+	/** Pull chunks from a piped Subprocess stream until it closes. */
+	async #pipeStream(stream: ReadableStream<Uint8Array>, onChunk: (chunk: Uint8Array) => void): Promise<void> {
+		const reader = stream.getReader();
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				onChunk(value);
+			}
+		} catch {
+			// Stream aborted by kill - session death is handled via `exited`.
+		} finally {
+			reader.releaseLock();
+		}
+	}
+
+	#addExitHandler(handler: () => void): () => void {
+		this.#exitHandlers.add(handler);
+		return () => {
+			this.#exitHandlers.delete(handler);
+		};
+	}
+
+	#emitExit(): void {
+		for (const handler of [...this.#exitHandlers]) handler();
 	}
 
 	/** Run one command. Serialized per session: concurrent callers wait. */
@@ -166,22 +217,30 @@ export class PwshSession {
 			this.#pending.set(id, { resolve, reject });
 		});
 
-		proc.stdin?.write(line + "\n");
+		proc.stdin.write(line + "\n");
 
-		let timeoutTimer: NodeJS.Timeout | undefined;
+		let timeoutTimer: TimerHandle | undefined;
 		let settled = false;
+		let offExit: () => void = () => {};
 		const killAndMark = (kind: "timeout" | "aborted"): void => {
 			const live = this.#proc;
 			if (!live) return;
 			this.#dead = true;
 			// Kill the whole process tree: pwsh may have spawned children.
-			const killer = spawn("taskkill", ["/PID", String(live.pid), "/T", "/F"], {
-				stdio: "ignore",
+			const killer = Bun.spawn(["taskkill", "/PID", String(live.pid), "/T", "/F"], {
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
 				windowsHide: true,
 			});
-			killer.on("exit", () => {
-				this.#proc = null;
-			});
+			killer.exited.then(
+				() => {
+					if (this.#proc === live) this.#proc = null;
+				},
+				() => {
+					if (this.#proc === live) this.#proc = null;
+				},
+			);
 			// Fallback: direct kill if taskkill fails to deliver within grace.
 			setTimeout(() => {
 				if (this.#proc === live) {
@@ -200,12 +259,11 @@ export class PwshSession {
 			settled = true;
 			killAndMark("aborted");
 			this.#pending.delete(id);
-			proc.removeListener("exit", onExit);
+			offExit();
 			resolveResult({ aborted: true, partialOutput: this.#latestOutput });
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
-		let resolved = false;
 		let resolveResult = (_r: PwshRunResult): void => {};
 		const resultPromise = new Promise<PwshRunResult>(res => {
 			resolveResult = res;
@@ -218,7 +276,7 @@ export class PwshSession {
 				settled = true;
 				killAndMark("timeout");
 				this.#pending.delete(id);
-				proc.removeListener("exit", onExit);
+				offExit();
 				resolveResult({ timedOut: true, partialOutput: this.#latestOutput });
 			}, options.timeoutMs);
 		}
@@ -230,14 +288,14 @@ export class PwshSession {
 			this.#pending.delete(id);
 			resolveResult({ dead: true, partialOutput: this.#latestOutput });
 		};
-		proc.on("exit", onExit);
+		offExit = this.#addExitHandler(onExit);
 
 		response
 			.then(r => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timeoutTimer);
-				proc.removeListener("exit", onExit);
+				offExit();
 				resolveResult({ response: r });
 			})
 			.catch(() => {
@@ -281,9 +339,17 @@ export class PwshSession {
 		const live = this.#proc;
 		this.#proc = null;
 		if (live && live.pid != null && !live.killed) {
-			const killer = spawn("taskkill", ["/PID", String(live.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+			const killer = Bun.spawn(["taskkill", "/PID", String(live.pid), "/T", "/F"], {
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				windowsHide: true,
+			});
 			await new Promise<void>(res => {
-				killer.on("exit", () => res());
+				killer.exited.then(
+					() => res(),
+					() => res(),
+				);
 				setTimeout(res, KILL_GRACE_MS).unref();
 			});
 		}
