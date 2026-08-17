@@ -257,7 +257,7 @@ function ansiSafeSlice(text: string, max: number): string {
 	let visible = 0;
 	let out = "";
 	let i = 0;
-	while (i < text.length && visible < max) {
+	while (i < text.length) {
 		if (text[i] === "\x1b") {
 			const end = text.indexOf("m", i);
 			if (end === -1) {
@@ -266,16 +266,64 @@ function ansiSafeSlice(text: string, max: number): string {
 			}
 			out += text.slice(i, end + 1);
 			i = end + 1;
-		} else {
-			const w = charWidth(text[i]!);
-			if (visible + w > max) break;
-			out += text[i]!;
-			visible += w;
-			i++;
+			continue;
 		}
+		if (visible >= max) break;
+		const w = charWidth(text[i]!);
+		if (visible + w > max) break;
+		out += text[i]!;
+		visible += w;
+		i++;
 	}
 	if (i < text.length) out += "…";
 	return out;
+}
+
+/** Wrap ANSI-colored text into terminal-width rows without dropping characters. */
+function wrapAnsiLine(text: string, max: number): string[] {
+	if (max <= 0) return [text];
+	const rows: string[] = [];
+	let row = "";
+	let visible = 0;
+	let activeSgr = "";
+	let i = 0;
+	while (i < text.length) {
+		if (text[i] === "\x1b") {
+			const end = text.indexOf("m", i);
+			if (end === -1) {
+				row += text.slice(i);
+				break;
+			}
+			const sequence = text.slice(i, end + 1);
+			row += sequence;
+			if (sequence.startsWith("\x1b[")) {
+				const params = sequence.slice(2, -1).split(";").filter(Boolean);
+				if (params.length === 0 || params.some(param => param === "0" || param === "39" || param === "49")) {
+					activeSgr = "";
+				} else {
+					activeSgr += sequence;
+				}
+			}
+			i = end + 1;
+			continue;
+		}
+
+		const codePoint = text.codePointAt(i) ?? 0;
+		const char = String.fromCodePoint(codePoint);
+		const width = charWidth(char);
+		if (visible > 0 && visible + width > max) {
+			if (activeSgr) row += "\x1b[0m";
+			rows.push(row);
+			row = activeSgr;
+			visible = 0;
+		}
+		row += char;
+		visible += width;
+		i += char.length;
+	}
+	if (activeSgr) row += "\x1b[0m";
+	if (row || rows.length === 0) rows.push(row);
+	return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +506,7 @@ function renderStatusLabel(d: PwshDetails, isError: boolean, theme: Theme): stri
 }
 
 /**
- * Command block rows: titled frame with up to 4 highlighted command lines.
+ * Command block rows: wrapped highlighted command lines, up to four source lines.
  * Shared by renderCall and renderResult (pending + merged frames).
  * `closed: false` leaves the frame open (no bottom bar) so a merged
  * renderResult can follow with the status divider + output + single bottom.
@@ -479,7 +527,10 @@ function commandBlock(
 	} catch {
 		highlighted = command.split("\n").slice(0, 4);
 	}
-	for (const l of highlighted) out.push(frameRow(l, width, theme));
+	const maxCommandWidth = Math.max(1, frameInnerWidth(width) - 2);
+	for (const line of highlighted) {
+		for (const wrapped of wrapAnsiLine(line, maxCommandWidth)) out.push(frameRow(wrapped, width, theme));
+	}
 	if (closed) out.push(frameBottom(width, theme));
 	return out;
 }
