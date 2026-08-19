@@ -66,7 +66,9 @@ while ($true) {
         $global:LASTEXITCODE = $null  # clear stale native exit code from prior requests
         $captured = . ([scriptblock]::Create([string]$req.code)) 2>&1
         if ($req.format -eq 'json') {
-            $output = ($captured | ConvertTo-Json -Depth 8 -Compress) -join "`n"
+            # PowerShell's default depth is 2; use the documented maximum so
+            # nested objects such as Icons are not silently stringified.
+            $output = ($captured | ConvertTo-Json -Depth 100 -Compress) -join "`n"
         } else {
             $output = $captured | Out-String -Width $width
         }

@@ -535,7 +535,7 @@ function commandBlock(
 	return out;
 }
 
-function renderBody(d: PwshDetails, expanded: boolean, theme: Theme): string[] {
+function renderBody(d: PwshDetails, expanded: boolean, theme: Theme, width: number): string[] {
 	// Normalize CRLF: pwsh emits \r\n frames that would make the terminal
 	// cursor jump back to line start (blank-looking rows).
 	const body = (d.error ?? d.output ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -548,11 +548,12 @@ function renderBody(d: PwshDetails, expanded: boolean, theme: Theme): string[] {
 	while (raw.length > 0 && raw[raw.length - 1]!.trim() === "") raw.pop();
 	const bodyLines: string[] = [];
 	let prevBlank = false;
-	for (const l of raw) {
-		const blank = l.trim() === "";
+	const maxBodyWidth = Math.max(1, frameInnerWidth(width) - 2);
+	for (const line of raw) {
+		const blank = line.trim() === "";
 		if (blank && prevBlank) continue;
 		prevBlank = blank;
-		bodyLines.push(l);
+		bodyLines.push(...wrapAnsiLine(line, maxBodyWidth));
 	}
 	const lines = bodyLines.slice(0, maxLines);
 	if (bodyLines.length > maxLines) {
@@ -576,12 +577,12 @@ export function definePwshTool(pi: ExtensionAPI) {
 		mergeCallAndResult: true as boolean,
 		parameters: z.object({
 			command: z.string().describe("PowerShell script to execute (multi-line / script blocks supported)"),
-			"cwd?": z.string().optional().describe("working directory; Set-Location inside a command may drift"),
-			"env?": z.object({ "[string]": z.string() }).optional().describe("extra environment variables (restored after execution)"),
-			"format?": z.enum(["text", "json"]).optional().describe("text=Out-String (default); json=ConvertTo-Json -Depth 8"),
-			"width?": z.number().optional().describe("Out-String width, default 200, range 40-4096"),
-			"timeout?": z.number().optional().describe(`timeout in seconds; 0 disables; default ${DEFAULT_TIMEOUT_SEC}; range ${MIN_TIMEOUT_SEC}-${MAX_TIMEOUT_SEC}`),
-			"session?": z.string().optional().describe("custom session name to isolate the process pool"),
+			cwd: z.string().optional().describe("working directory; Set-Location inside the session may drift"),
+			env: z.object({ "[string]": z.string() }).optional().describe("extra environment variables (restored after execution)"),
+			format: z.enum(["text", "json"]).optional().describe("text=Out-String (default); json=ConvertTo-Json -Depth 100"),
+			width: z.number().optional().describe("Out-String width, default 200, range 40-4096"),
+			timeout: z.number().optional().describe(`timeout in seconds; 0 disables; default ${DEFAULT_TIMEOUT_SEC}; range ${MIN_TIMEOUT_SEC}-${MAX_TIMEOUT_SEC}`),
+			session: z.string().optional().describe("custom session name to isolate the process pool"),
 		}),
 		async execute(
 			_toolCallId: string,
@@ -624,9 +625,9 @@ export function definePwshTool(pi: ExtensionAPI) {
 			}
 			const expanded = options.expanded === true;
 			const statusLabel = renderStatusLabel(d, result.isError === true, theme);
-			const bodyLines = renderBody(d, expanded, theme);
 			return {
 				render: (width: number) => {
+					const bodyLines = renderBody(d, expanded, theme, width);
 					// Command block (merged frame, like built-in tools) - left open
 					// so the status divider + output rows share one frame with a
 					// single bottom bar.

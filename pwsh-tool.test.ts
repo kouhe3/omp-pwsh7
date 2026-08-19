@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { definePwshTool } from "./pwsh-tool";
+import { PwshSessionPool } from "./session";
 
 const schema = () => ({
 	describe() {
@@ -64,4 +65,79 @@ test("keeps the complete reported command tail visible after wrapping", () => {
 
 	expect(rendered).not.toContain("…");
 	expect(rendered).toContain("Out-String");
+});
+
+test("uses normal optional property names in the public tool schema", () => {
+	const objectShapes: Array<Record<string, unknown>> = [];
+	const node = () => ({
+		optional() {
+			return this;
+		},
+		describe() {
+			return this;
+		},
+	});
+	const z = {
+		string: node,
+		number: node,
+		enum: node,
+		object(shape: Record<string, unknown>) {
+			objectShapes.push(shape);
+			return node();
+		},
+	};
+
+	definePwshTool({ zod: z } as never);
+	expect(Object.keys(objectShapes.at(-1)!)).toEqual(["command", "cwd", "env", "format", "width", "timeout", "session"]);
+});
+
+test("preserves deeply nested objects in JSON format", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	try {
+		const session = pool.getOrCreate(`json-depth-${Date.now()}`, process.cwd());
+		const result = await session.run(
+			{
+				code: "$v = [pscustomobject]@{ Value = 'preserve-me' }; 1..12 | ForEach-Object { $v = [pscustomobject]@{ Level = $_; Child = $v } }; [pscustomobject]@{ Name = 'root'; Icons = $v }",
+				format: "json",
+			},
+			{ timeoutMs: 30_000 },
+		);
+		expect(result.response?.error ?? null).toBeNull();
+		const value = JSON.parse(result.response?.output ?? "null") as { Name: string; Icons: { Child: { Child: unknown } } };
+		expect(value.Name).toBe("root");
+		expect(value.Icons.Child.Child).not.toBe("@{Level=4; Child=}");
+		expect(JSON.stringify(value)).toContain("preserve-me");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("wraps long output without replacing its tail with an ellipsis", () => {
+	const output = JSON.stringify({ Name: "root", Icons: { Value: "preserve-me", Padding: "x".repeat(180) } });
+	const tool = definePwshTool({ zod: zStub } as never);
+	const rows = tool
+		.renderResult(
+			{
+				details: {
+					cwd: ".",
+					sessionKey: ".",
+					format: "json",
+					timeoutSec: 30,
+					exitCode: 0,
+					output,
+					wallTimeMs: 1,
+				},
+			},
+			{},
+			theme,
+			{ command: "Get-Value" },
+		)
+		.render(80);
+	const dividerIndex = rows.findIndex(row => row.includes("completed"));
+	const outputRows = rows
+		.slice(dividerIndex + 1, -1)
+		.map(row => row.replace(/\x1b\[[0-9;]*m/g, "").slice(2, -2).trimEnd());
+
+	expect(rows.join("\n")).not.toContain("…");
+	expect(outputRows.join("")).toBe(output);
 });
