@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { definePwshTool } from "./pwsh-tool";
+import { definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 
 const schema = () => ({
@@ -107,6 +107,78 @@ test("preserves deeply nested objects in JSON format", async () => {
 		expect(value.Name).toBe("root");
 		expect(value.Icons.Child.Child).not.toBe("@{Level=4; Child=}");
 		expect(JSON.stringify(value)).toContain("preserve-me");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("streams text output before the command completes", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	try {
+		const updates: Array<{ text: string; elapsedMs: number }> = [];
+		const started = Date.now();
+		const result = await runPwsh(
+			{
+				command: "Write-Output 'first'; Start-Sleep -Milliseconds 600; Write-Output 'second'",
+				cwd: process.cwd(),
+				timeout: 10,
+			},
+			pool,
+			update => updates.push({ text: update.content[0]?.text ?? "", elapsedMs: Date.now() - started }),
+		);
+
+		const firstOutput = updates.find(update => update.text.includes("first"));
+		expect(firstOutput).toBeDefined();
+		expect(firstOutput!.elapsedMs).toBeLessThan(550);
+		expect(updates.at(-1)?.text).toContain("second");
+		expect(result.text).toContain("first");
+		expect(result.text).toContain("second");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("keeps JSON output as one final document without streaming fragments", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	try {
+		const updates: string[] = [];
+		const result = await runPwsh(
+			{ command: "1..2 | ForEach-Object { [pscustomobject]@{ Value = $_ } }", cwd: process.cwd(), format: "json" },
+			pool,
+			update => updates.push(update.content[0]?.text ?? ""),
+		);
+
+		expect(updates.some(update => update.includes("Value"))).toBe(false);
+		expect(JSON.parse(result.details.output ?? "null")).toEqual([{ Value: 1 }, { Value: 2 }]);
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("preserves session state after a streamed command", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	try {
+		const session = pool.getOrCreate(`stream-state-${Date.now()}`, process.cwd());
+		await session.run({ code: "$streamState = 42; Write-Output 'ready'", format: "text" }, { timeoutMs: 10_000 });
+		const result = await session.run({ code: "$streamState", format: "text" }, { timeoutMs: 10_000 });
+
+		expect(result.response?.output?.trim()).toBe("42");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("returns streamed output when a command times out", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	try {
+		const session = pool.getOrCreate(`stream-timeout-${Date.now()}`, process.cwd());
+		const result = await session.run(
+			{ code: "Write-Output 'before-timeout'; Start-Sleep -Seconds 3", format: "text" },
+			{ timeoutMs: 700 },
+		);
+
+		expect(result.timedOut).toBe(true);
+		expect(result.partialOutput).toContain("before-timeout");
 	} finally {
 		pool.disposeAll();
 	}

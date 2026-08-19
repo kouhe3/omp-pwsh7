@@ -13,15 +13,23 @@ export interface PwshRequest {
 }
 
 export interface PwshResponse {
+	type?: "result";
 	id: number;
 	output?: string | null;
 	error?: string | null;
 	exitCode?: number | null;
 }
 
+interface PwshChunk {
+	type: "chunk";
+	id: number;
+	text: string;
+}
+
 export interface PwshRunOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
+	onChunk?: (text: string) => void;
 }
 
 export interface PwshRunResult {
@@ -63,7 +71,10 @@ export class PwshSession {
 	#proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | null = null;
 	#dead = false;
 	#buffer = "";
-	#pending = new Map<number, { resolve: (r: PwshResponse) => void; reject: (e: Error) => void }>();
+	#pending = new Map<
+		number,
+		{ resolve: (r: PwshResponse) => void; reject: (e: Error) => void; onChunk?: (text: string) => void }
+	>();
 	/** Per-request "process exited" subscribers (Bun has no event emitter on Subprocess). */
 	#exitHandlers = new Set<() => void>();
 	/** Persistent decoders: UTF-8 multibyte chars can straddle stream chunks. */
@@ -213,8 +224,9 @@ export class PwshSession {
 		const line = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
 		const proc = this.#proc;
 
+		this.#latestOutput = "";
 		const response = new Promise<PwshResponse>((resolve, reject) => {
-			this.#pending.set(id, { resolve, reject });
+			this.#pending.set(id, { resolve, reject, onChunk: options.onChunk });
 		});
 
 		proc.stdin.write(line + "\n");
@@ -314,17 +326,28 @@ export class PwshSession {
 			const line = this.#buffer.slice(0, nl).trim();
 			this.#buffer = this.#buffer.slice(nl + 1);
 			if (!line) continue;
-			let resp: PwshResponse;
+			let frame: PwshResponse | PwshChunk;
 			try {
-				resp = JSON.parse(Buffer.from(line, "base64").toString("utf8")) as PwshResponse;
+				frame = JSON.parse(Buffer.from(line, "base64").toString("utf8")) as PwshResponse | PwshChunk;
 			} catch {
 				continue; // garbage line (e.g. startup noise) - ignore
 			}
-			this.#latestOutput = resp.output ?? resp.error ?? "";
-			const pending = this.#pending.get(resp.id);
+			const pending = this.#pending.get(frame.id);
+			if (frame.type === "chunk") {
+				this.#latestOutput += frame.text;
+				if (pending?.onChunk) {
+					try {
+						pending.onChunk(frame.text);
+					} catch {
+						// A UI update failure must not corrupt the protocol reader.
+					}
+				}
+				continue;
+			}
+			this.#latestOutput = frame.output ?? frame.error ?? this.#latestOutput;
 			if (pending) {
-				this.#pending.delete(resp.id);
-				pending.resolve(resp);
+				this.#pending.delete(frame.id);
+				pending.resolve(frame);
 			}
 		}
 	}

@@ -14,6 +14,7 @@ const MAX_TIMEOUT_SEC = 3600;
 const DEFAULT_WIDTH = 200;
 const MIN_WIDTH = 40;
 const MAX_WIDTH = 4096;
+const STREAM_PREVIEW_CHARS = 50 * 1024;
 
 export interface PwshParams {
 	command: string;
@@ -33,13 +34,17 @@ export interface PwshDetails {
 	exitCode?: number | null;
 	timedOut?: boolean;
 	dead?: boolean;
+	streaming?: boolean;
 	error?: string | null;
 	output?: string | null;
 	wallTimeMs: number;
 }
 
 interface SessionLike {
-	run(req: { code: string; env?: Record<string, string>; width?: number; format?: "text" | "json" }, opts: { timeoutMs?: number; signal?: AbortSignal }): Promise<PwshRunResult>;
+	run(
+		req: { code: string; env?: Record<string, string>; width?: number; format?: "text" | "json" },
+		opts: { timeoutMs?: number; signal?: AbortSignal; onChunk?: (text: string) => void },
+	): Promise<PwshRunResult>;
 }
 
 interface PwshApi {
@@ -51,11 +56,16 @@ export function buildSessionKey(cwd: string, session?: string): string {
 	return `${cwd}\n${session ?? ""}`;
 }
 
+type PwshUpdate = {
+	content: Array<{ type: "text"; text: string }>;
+	details?: Partial<PwshDetails>;
+};
+
 /** Core execute body - split out for smoke tests. */
 export async function runPwsh(
 	params: PwshParams,
 	api: PwshApi,
-	onUpdate?: (update: { content: Array<{ type: "text"; text: string }> }) => void,
+	onUpdate?: (update: PwshUpdate) => void,
 	signal?: AbortSignal,
 ): Promise<{ text: string; details: PwshDetails; isError?: boolean }> {
 	const started = Date.now();
@@ -86,6 +96,7 @@ export async function runPwsh(
 	const format = params.format === "json" ? "json" : "text";
 	const sessionKey = buildSessionKey(cwd, params.session);
 	const session = api.getOrCreate(sessionKey, cwd);
+	let streamPreview = "";
 
 	const runResult = await session.run(
 		{
@@ -94,7 +105,28 @@ export async function runPwsh(
 			width,
 			format,
 		},
-		{ timeoutMs: timeoutSec === 0 ? undefined : timeoutSec * 1000, signal },
+		{
+			timeoutMs: timeoutSec === 0 ? undefined : timeoutSec * 1000,
+			signal,
+			onChunk:
+				format === "text"
+					? chunk => {
+							streamPreview = (streamPreview + chunk).slice(-STREAM_PREVIEW_CHARS);
+							onUpdate?.({
+								content: [{ type: "text", text: streamPreview }],
+								details: {
+									cwd,
+									sessionKey,
+									format,
+									timeoutSec,
+									streaming: true,
+									output: streamPreview,
+									wallTimeMs: Date.now() - started,
+								},
+							});
+						}
+					: undefined,
+		},
 	);
 
 	const wallTimeMs = Date.now() - started;
@@ -495,6 +527,9 @@ interface PwshRenderOptions {
 
 /** Status icon + label for the divider line (exit-code aware). */
 function renderStatusLabel(d: PwshDetails, isError: boolean, theme: Theme): string {
+	if (d.streaming) {
+		return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
+	}
 	const exitBad = d.exitCode !== null && d.exitCode !== undefined && d.exitCode !== 0;
 	const bad = isError || exitBad;
 	const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";

@@ -2,7 +2,8 @@
 #
 # Protocol (line-based, UTF-8, no length prefix needed - base64 is line-safe):
 #   [stdin]  base64(JSON { id, code, env?, width?, format? }) + "\n"
-#   [stdout] base64(JSON { id, output?, error?, exitCode? }) + "\n"
+#   [stdout] base64(JSON { type = 'chunk', id, text }) + "\n" (text format only, repeated)
+#   [stdout] base64(JSON { type = 'result', id, output?, error?, exitCode? }) + "\n"
 #
 # Critical: code is executed with dot-source (`. $sb`) so variable/module
 # assignments persist in THIS process scope across requests. A call operator
@@ -21,6 +22,15 @@ try { $PSStyle.OutputRendering = 'PlainText' } catch { }
 
 $DEFAULT_WIDTH = 200
 
+function Send-ProtocolFrame {
+    param([hashtable]$Frame)
+
+    $json = $Frame | ConvertTo-Json -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    [Console]::Out.WriteLine([Convert]::ToBase64String($bytes))
+    [Console]::Out.Flush()
+}
+
 while ($true) {
     $b64Line = [Console]::In.ReadLine()
     if ($null -eq $b64Line) { break }   # parent closed stdin -> exit
@@ -32,9 +42,7 @@ while ($true) {
         $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line))
         $req = $json | ConvertFrom-Json
     } catch {
-        $resp = @{ id = -1; error = "protocol decode failed: $($_.Exception.Message)" } | ConvertTo-Json -Compress
-        [Console]::Out.WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($resp)))
-        [Console]::Out.Flush()
+        Send-ProtocolFrame @{ type = 'result'; id = -1; error = "protocol decode failed: $($_.Exception.Message)" }
         continue
     }
 
@@ -64,13 +72,21 @@ while ($true) {
         }
 
         $global:LASTEXITCODE = $null  # clear stale native exit code from prior requests
-        $captured = . ([scriptblock]::Create([string]$req.code)) 2>&1
         if ($req.format -eq 'json') {
+            $captured = . ([scriptblock]::Create([string]$req.code)) 2>&1
             # PowerShell's default depth is 2; use the documented maximum so
             # nested objects such as Icons are not silently stringified.
             $output = ($captured | ConvertTo-Json -Depth 100 -Compress) -join "`n"
         } else {
-            $output = $captured | Out-String -Width $width
+            $lines = [System.Collections.Generic.List[string]]::new()
+            . ([scriptblock]::Create([string]$req.code)) 2>&1 |
+                Out-String -Width $width -Stream |
+                ForEach-Object {
+                    $text = [string]$_
+                    $lines.Add($text)
+                    Send-ProtocolFrame @{ type = 'chunk'; id = $req.id; text = ($text + "`n") }
+                }
+            $output = if ($lines.Count -gt 0) { ($lines -join "`n") + "`n" } else { $null }
         }
     } catch {
         $errorText = $_.Exception.Message
@@ -78,12 +94,11 @@ while ($true) {
         foreach ($k in $envKeys) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
     }
 
-    $resp = @{
+    Send-ProtocolFrame @{
+        type = 'result'
         id = $req.id
         output = $output
         error = $errorText
         exitCode = $global:LASTEXITCODE
-    } | ConvertTo-Json -Compress
-    [Console]::Out.WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($resp)))
-    [Console]::Out.Flush()
+    }
 }
