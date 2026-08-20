@@ -6,7 +6,11 @@
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import hljs from "highlight.js/lib/core";
+import powershell from "highlight.js/lib/languages/powershell";
 import { PwshSessionPool, type PwshRunResult } from "./session";
+
+hljs.registerLanguage("powershell", powershell);
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -359,77 +363,100 @@ function wrapAnsiLine(text: string, max: number): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Lightweight PowerShell syntax highlighter.
+// PowerShell syntax highlighter via highlight.js.
 //
-// The native highlighter (pi-natives 17.2.15) advertises powershell/ps1 via
-// its alias table but ships no PowerShell syntax, so highlightCode() returns
-// plain text for it. This tokenizer covers the common surface (strings,
-// comments, variables, keywords, cmdlets, operators, numbers) with theme
-// syntax colors; swap for the native path when upstream bundles the grammar.
+// Uses highlight.js/lib/core + highlight.js/lib/languages/powershell to parse
+// the full PowerShell grammar (including cmdlets, subexpressions, variables,
+// multiline comments/strings, parameter switches) and maps AST token classes
+// to OMP theme syntax colors.
 // ---------------------------------------------------------------------------
 
-const PS_KEYWORDS: Record<string, true> = {
-	if: true, else: true, elseif: true, foreach: true, for: true, while: true,
-	do: true, until: true, switch: true, function: true, filter: true, param: true,
-	return: true, break: true, continue: true, try: true, catch: true, finally: true,
-	throw: true, begin: true, process: true, end: true, class: true, enum: true,
-	module: true, using: true, exit: true, in: true, not: true, and: true, or: true,
-	eq: true, ne: true, gt: true, lt: true, ge: true, le: true, true: true, false: true,
-	null: true, new: true, global: true, script: true, local: true, private: true,
-};
-
-const PS_TOKEN_RE =
-	/('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|#[^\n]*|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}\n]+\}|[A-Za-z][A-Za-z0-9]*-(?:[A-Za-z][A-Za-z0-9]*)?|-[A-Za-z]{1,4}\b|\d+(?:\.\d+)?|[|&;(){}\[\],=+*/%<>])/g;
-
-type PsTokenKind = "string" | "comment" | "variable" | "keyword" | "cmdlet" | "operator" | "number" | "punct";
-
-function classifyPsToken(tok: string): PsTokenKind {
-	if (tok.startsWith("'") || tok.startsWith('"')) return "string";
-	if (tok.startsWith("#")) return "comment";
-	if (tok.startsWith("$") || tok.startsWith("${")) return "variable";
-	if (/^-{1,2}[a-z]+$/i.test(tok) || /^[|&<>=+*/%]+$/.test(tok)) return "operator";
-	if (/^\d/.test(tok)) return "number";
-	const lower = tok.toLowerCase();
-	if (PS_KEYWORDS[lower] === true) return "keyword";
-	// PascalCase verb-noun (cmdlet) or a bare command word
-	if (/^[A-Z][A-Za-z0-9]*-[A-Za-z]/.test(tok) || /^[A-Za-z][A-Za-z0-9]*$/.test(tok)) return "cmdlet";
-	return "punct";
-}
-
-const PS_TOKEN_COLOR: Record<PsTokenKind, string> = {
+const HLJS_TO_THEME_COLOR: Record<string, string> = {
+	keyword: "syntaxKeyword",
+	built_in: "syntaxFunction",
+	function: "syntaxFunction",
+	title: "syntaxFunction",
 	string: "syntaxString",
 	comment: "syntaxComment",
+	doctag: "syntaxComment",
 	variable: "syntaxVariable",
-	keyword: "syntaxKeyword",
-	cmdlet: "syntaxFunction",
+	params: "syntaxVariable",
+	attr: "syntaxVariable",
+	literal: "syntaxOperator",
 	operator: "syntaxOperator",
 	number: "syntaxNumber",
-	punct: "syntaxPunctuation",
+	type: "syntaxType",
+	class: "syntaxType",
+	punctuation: "syntaxPunctuation",
+	"selector-tag": "syntaxPunctuation",
 };
 
-/** Highlight a PowerShell command line, returning one ANSI-colored string per line. */
-function highlightPowerShell(code: string, theme: Theme): string[] {
-	const out: string[] = [];
-	for (const line of code.split("\n")) {
-		let result = "";
-		let last = 0;
-		PS_TOKEN_RE.lastIndex = 0;
-		let m: RegExpExecArray | null;
-		while ((m = PS_TOKEN_RE.exec(line)) !== null) {
-			const start = m.index;
-			if (start > last) result += line.slice(last, start);
-			const tok = m[0]!;
-			const kind = classifyPsToken(tok);
-			const color = PS_TOKEN_COLOR[kind];
-			result += typeof theme.fg === "function" ? theme.fg(color, tok) : tok;
-			last = start + tok.length;
-		}
-		if (last < line.length) result += line.slice(last);
-		out.push(result);
-	}
-	return out;
+function unescapeHtml(text: string): string {
+	return text
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;|&#x27;/g, "'");
 }
 
+/** Highlight a PowerShell command line, returning one ANSI-colored string per line. */
+export function highlightPowerShell(code: string, theme: Theme): string[] {
+	const highlightedHtml = hljs.highlight(code, { language: "powershell", ignoreIllegals: true }).value;
+
+	const lines: string[] = [];
+	let currentLine = "";
+	const colorStack: string[] = [];
+
+	const emitText = (text: string) => {
+		if (!text) return;
+		const parts = text.split("\n");
+		for (let i = 0; i < parts.length; i++) {
+			if (i > 0) {
+				lines.push(currentLine);
+				currentLine = "";
+			}
+			const part = parts[i];
+			if (part) {
+				const unescaped = unescapeHtml(part);
+				const currentColor = colorStack[colorStack.length - 1];
+				if (currentColor && typeof theme.fg === "function") {
+					currentLine += theme.fg(currentColor, unescaped);
+				} else {
+					currentLine += unescaped;
+				}
+			}
+		}
+	};
+
+	const tagRegex = /<span class="hljs-([^"]+)">|<\/span>/g;
+	let lastIndex = 0;
+	let match: RegExpExecArray | null;
+
+	while ((match = tagRegex.exec(highlightedHtml)) !== null) {
+		const chunk = highlightedHtml.slice(lastIndex, match.index);
+		if (chunk) {
+			emitText(chunk);
+		}
+
+		if (match[0].startsWith("<span")) {
+			const cls = match[1]!;
+			const color = HLJS_TO_THEME_COLOR[cls] || "";
+			colorStack.push(color);
+		} else {
+			colorStack.pop();
+		}
+		lastIndex = tagRegex.lastIndex;
+	}
+
+	const tail = highlightedHtml.slice(lastIndex);
+	if (tail) {
+		emitText(tail);
+	}
+
+	lines.push(currentLine);
+	return lines;
+}
 // ---------------------------------------------------------------------------
 // Eval-style frame builders: titled top bar, tee divider with label, rows,
 // bottom bar. Mirrors the built-in eval/bash rendering (`╭─── Title ───╮`,

@@ -4,5 +4,8 @@
   "description": "Persistent PowerShell 7 session tool for OMP",
   "type": "module",
   "main": "index.ts",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "highlight.js": "^11.12.0"
+  }
 }

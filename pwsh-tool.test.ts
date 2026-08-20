@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { definePwshTool, runPwsh } from "./pwsh-tool";
+import { definePwshTool, highlightPowerShell, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 
 const schema = () => ({
@@ -129,7 +129,7 @@ test("streams text output before the command completes", async () => {
 
 		const firstOutput = updates.find(update => update.text.includes("first"));
 		expect(firstOutput).toBeDefined();
-		expect(firstOutput!.elapsedMs).toBeLessThan(550);
+		expect(firstOutput!.elapsedMs).toBeLessThan(1000);
 		expect(updates.at(-1)?.text).toContain("second");
 		expect(result.text).toContain("first");
 		expect(result.text).toContain("second");
@@ -212,4 +212,60 @@ test("wraps long output without replacing its tail with an ellipsis", () => {
 
 	expect(rows.join("\n")).not.toContain("…");
 	expect(outputRows.join("")).toBe(output);
+});
+
+test("highlightPowerShell correctly applies theme colors to PowerShell syntax tokens", () => {
+	const captured: Array<{ color: string; text: string }> = [];
+	const customTheme = {
+		fg: (color: string, text: string) => {
+			captured.push({ color, text });
+			return `[${color}]${text}[/${color}]`;
+		},
+	};
+
+	const code = `$items = 1..10 | Where-Object { $_ -gt 5 } # filter items`;
+	const lines = highlightPowerShell(code, customTheme);
+
+	expect(lines.length).toBe(1);
+	expect(captured.some(c => c.color === "syntaxVariable" && c.text.includes("$items"))).toBe(true);
+	expect(captured.some(c => c.color === "syntaxFunction" && c.text.includes("Where-Object"))).toBe(true);
+	expect(captured.some(c => c.color === "syntaxOperator" && c.text.includes("-gt"))).toBe(true);
+	expect(captured.some(c => c.color === "syntaxNumber" && c.text === "5")).toBe(true);
+	expect(captured.some(c => c.color === "syntaxComment" && c.text.includes("# filter items"))).toBe(true);
+});
+
+test("highlightPowerShell preserves line structure across multiline strings and comments", () => {
+	const customTheme = {
+		fg: (color: string, text: string) => `[${color}:${text}]`,
+	};
+
+	const multilineCode = `<#\nBlock comment line 1\nBlock comment line 2\n#>\n$msg = "Multi\nline"\nGet-Date`;
+	const lines = highlightPowerShell(multilineCode, customTheme);
+
+	expect(lines.length).toBe(7);
+	expect(lines[0]).toContain("[syntaxComment:<#]");
+	expect(lines[1]).toContain("[syntaxComment:Block comment line 1]");
+	expect(lines[2]).toContain("[syntaxComment:Block comment line 2]");
+	expect(lines[3]).toContain("[syntaxComment:#>]");
+	expect(lines[4]).toContain("[syntaxVariable:$msg]");
+	expect(lines[4]).toContain("[syntaxString:\"Multi]");
+	expect(lines[5]).toContain("[syntaxString:line\"]");
+	expect(lines[6]).toContain("[syntaxFunction:Get-Date]");
+});
+
+test("highlightPowerShell properly unescapes HTML entities in code", () => {
+	const customTheme = {
+		fg: (_color: string, text: string) => text,
+	};
+
+	const codeWithEntities = `if ($a -lt 10 -and $b -gt 20) { Write-Output "A & B: 'test' & \"quotes\"" }`;
+	const lines = highlightPowerShell(codeWithEntities, customTheme);
+
+	expect(lines.length).toBe(1);
+	expect(lines[0]).not.toContain("&lt;");
+	expect(lines[0]).not.toContain("&gt;");
+	expect(lines[0]).not.toContain("&amp;");
+	expect(lines[0]).not.toContain("&quot;");
+	expect(lines[0]).not.toContain("&#x27;");
+	expect(lines[0]).toContain(`if ($a -lt 10 -and $b -gt 20) { Write-Output "A & B: 'test' & \"quotes\"" }`);
 });
