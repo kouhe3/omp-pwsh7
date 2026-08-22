@@ -286,3 +286,39 @@ test("highlightPowerShell correctly tokenizes git branch commands", async () => 
 	expect(lines[0]).toContain("git checkout");
 	expect(lines[0]).toContain("verification");
 });
+test("registers the tool after cold-start highlighter initialization", async () => {
+	const indexUrl = new URL("./index.ts", import.meta.url).href;
+	const toolUrl = new URL("./pwsh-tool.ts", import.meta.url).href;
+	const childSource = `
+import registerPwsh from ${JSON.stringify(indexUrl)};
+import { highlightPowerShell } from ${JSON.stringify(toolUrl)};
+
+const schema = () => ({
+	describe() { return this; },
+	optional() { return this; },
+});
+const zod = { string: schema, number: schema, enum: schema, object: schema };
+const theme = { fg: (color, text) => \`[\${color}]\${text}[/\${color}]\` };
+let rendered = "";
+
+await registerPwsh({
+	setLabel() {},
+	zod,
+	registerTool() {
+		rendered = highlightPowerShell("$value = 1", theme).join("\\n");
+	},
+});
+console.log(JSON.stringify(rendered));
+`;
+	const proc = Bun.spawn(["bun", "-e", childSource], {
+		cwd: import.meta.dir,
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const output = await new Response(proc.stdout).text();
+	const exitCode = await proc.exited;
+
+	expect(exitCode).toBe(0);
+	expect(JSON.parse(output.trim())).toContain("[syntaxVariable]");
+});
