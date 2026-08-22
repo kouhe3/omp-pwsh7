@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { definePwshTool, highlightPowerShell, runPwsh } from "./pwsh-tool";
+import { definePwshTool, getHighlighterInstance, highlightPowerShell, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 
 const schema = () => ({
@@ -214,7 +214,8 @@ test("wraps long output without replacing its tail with an ellipsis", () => {
 	expect(outputRows.join("")).toBe(output);
 });
 
-test("highlightPowerShell correctly applies theme colors to PowerShell syntax tokens", () => {
+test("highlightPowerShell correctly applies theme colors to PowerShell syntax tokens", async () => {
+	await getHighlighterInstance();
 	const captured: Array<{ color: string; text: string }> = [];
 	const customTheme = {
 		fg: (color: string, text: string) => {
@@ -234,7 +235,8 @@ test("highlightPowerShell correctly applies theme colors to PowerShell syntax to
 	expect(captured.some(c => c.color === "syntaxComment" && c.text.includes("# filter items"))).toBe(true);
 });
 
-test("highlightPowerShell preserves line structure across multiline strings and comments", () => {
+test("highlightPowerShell preserves line structure across multiline strings and comments", async () => {
+	await getHighlighterInstance();
 	const customTheme = {
 		fg: (color: string, text: string) => `[${color}:${text}]`,
 	};
@@ -253,7 +255,8 @@ test("highlightPowerShell preserves line structure across multiline strings and 
 	expect(lines[6]).toContain("[syntaxFunction:Get-Date]");
 });
 
-test("highlightPowerShell properly unescapes HTML entities in code", () => {
+test("highlightPowerShell properly handles symbols in code without HTML escaping artifacts", async () => {
+	await getHighlighterInstance();
 	const customTheme = {
 		fg: (_color: string, text: string) => text,
 	};
@@ -262,10 +265,24 @@ test("highlightPowerShell properly unescapes HTML entities in code", () => {
 	const lines = highlightPowerShell(codeWithEntities, customTheme);
 
 	expect(lines.length).toBe(1);
-	expect(lines[0]).not.toContain("&lt;");
-	expect(lines[0]).not.toContain("&gt;");
-	expect(lines[0]).not.toContain("&amp;");
-	expect(lines[0]).not.toContain("&quot;");
-	expect(lines[0]).not.toContain("&#x27;");
 	expect(lines[0]).toContain(`if ($a -lt 10 -and $b -gt 20) { Write-Output "A & B: 'test' & \"quotes\"" }`);
+});
+
+test("highlightPowerShell correctly tokenizes git branch commands", async () => {
+	await getHighlighterInstance();
+	const captured: Array<{ color: string; text: string }> = [];
+	const customTheme = {
+		fg: (color: string, text: string) => {
+			captured.push({ color, text });
+			return `[${color}:${text}]`;
+		},
+	};
+
+	const code = `git checkout -b feat/issue-175-id-verification`;
+	const lines = highlightPowerShell(code, customTheme);
+
+	expect(lines.length).toBe(1);
+	// Shiki / TextMate treats unquoted words as plain text and operators as syntaxOperator
+	expect(lines[0]).toContain("git checkout");
+	expect(lines[0]).toContain("verification");
 });
