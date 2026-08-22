@@ -6,11 +6,8 @@
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import hljs from "highlight.js/lib/core";
-import powershell from "highlight.js/lib/languages/powershell";
+import { createHighlighter, type HighlighterGeneric } from "shiki";
 import { PwshSessionPool, type PwshRunResult } from "./session";
-
-hljs.registerLanguage("powershell", powershell);
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -363,99 +360,102 @@ function wrapAnsiLine(text: string, max: number): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// PowerShell syntax highlighter via highlight.js.
+// PowerShell syntax highlighter via Shiki (TextMate grammar).
 //
-// Uses highlight.js/lib/core + highlight.js/lib/languages/powershell to parse
-// the full PowerShell grammar (including cmdlets, subexpressions, variables,
-// multiline comments/strings, parameter switches) and maps AST token classes
-// to OMP theme syntax colors.
+// Uses Shiki's TextMate engine with a custom theme mapping TextMate scopes
+// (comments, strings, variables, cmdlets, operators, numbers, types, etc.)
+// to OMP theme semantic colors (syntaxComment, syntaxString, syntaxFunction...).
 // ---------------------------------------------------------------------------
 
-const HLJS_TO_THEME_COLOR: Record<string, string> = {
-	keyword: "syntaxKeyword",
-	built_in: "syntaxFunction",
-	function: "syntaxFunction",
-	title: "syntaxFunction",
-	string: "syntaxString",
-	comment: "syntaxComment",
-	doctag: "syntaxComment",
-	variable: "syntaxVariable",
-	params: "syntaxVariable",
-	attr: "syntaxVariable",
-	literal: "syntaxOperator",
-	operator: "syntaxOperator",
-	number: "syntaxNumber",
-	type: "syntaxType",
-	class: "syntaxType",
-	punctuation: "syntaxPunctuation",
-	"selector-tag": "syntaxPunctuation",
+export const OMP_SYNTAX_THEME = {
+	name: "omp-syntax",
+	type: "dark" as const,
+	fg: "default",
+	bg: "transparent",
+	settings: [
+		{
+			scope: ["comment", "punctuation.definition.comment"],
+			settings: { foreground: "syntaxComment" },
+		},
+		{
+			scope: ["string", "punctuation.definition.string", "string.quoted"],
+			settings: { foreground: "syntaxString" },
+		},
+		{
+			scope: ["variable", "support.variable", "punctuation.definition.variable"],
+			settings: { foreground: "syntaxVariable" },
+		},
+		{
+			scope: ["keyword", "storage.type", "storage.modifier", "keyword.control"],
+			settings: { foreground: "syntaxKeyword" },
+		},
+		{
+			scope: ["keyword.operator"],
+			settings: { foreground: "syntaxOperator" },
+		},
+		{
+			scope: ["entity.name.function", "support.function", "entity.name.command"],
+			settings: { foreground: "syntaxFunction" },
+		},
+		{
+			scope: ["constant.numeric"],
+			settings: { foreground: "syntaxNumber" },
+		},
+		{
+			scope: ["entity.name.type", "support.class", "storage.type.powershell", "storage.type.cs"],
+			settings: { foreground: "syntaxType" },
+		},
+		{
+			scope: ["punctuation.section", "punctuation.separator", "punctuation.terminator"],
+			settings: { foreground: "syntaxPunctuation" },
+		},
+	],
 };
 
-function unescapeHtml(text: string): string {
-	return text
-		.replace(/&amp;/g, "&")
-		.replace(/&lt;/g, "<")
-		.replace(/&gt;/g, ">")
-		.replace(/&quot;/g, '"')
-		.replace(/&#39;|&#x27;/g, "'");
+let cachedHighlighter: HighlighterGeneric<any, any> | null = null;
+let highlighterPromise: Promise<HighlighterGeneric<any, any>> | null = null;
+
+export async function getHighlighterInstance(): Promise<HighlighterGeneric<any, any>> {
+	if (cachedHighlighter) return cachedHighlighter;
+	if (!highlighterPromise) {
+		highlighterPromise = createHighlighter({
+			themes: [OMP_SYNTAX_THEME],
+			langs: ["powershell"],
+		}).then(h => {
+			cachedHighlighter = h;
+			return h;
+		});
+	}
+	return highlighterPromise;
 }
+
+// Eager background preloading
+getHighlighterInstance().catch(() => {});
 
 /** Highlight a PowerShell command line, returning one ANSI-colored string per line. */
 export function highlightPowerShell(code: string, theme: Theme): string[] {
-	const highlightedHtml = hljs.highlight(code, { language: "powershell", ignoreIllegals: true }).value;
-
-	const lines: string[] = [];
-	let currentLine = "";
-	const colorStack: string[] = [];
-
-	const emitText = (text: string) => {
-		if (!text) return;
-		const parts = text.split("\n");
-		for (let i = 0; i < parts.length; i++) {
-			if (i > 0) {
-				lines.push(currentLine);
-				currentLine = "";
-			}
-			const part = parts[i];
-			if (part) {
-				const unescaped = unescapeHtml(part);
-				const currentColor = colorStack[colorStack.length - 1];
-				if (currentColor && typeof theme.fg === "function") {
-					currentLine += theme.fg(currentColor, unescaped);
-				} else {
-					currentLine += unescaped;
-				}
-			}
-		}
-	};
-
-	const tagRegex = /<span class="hljs-([^"]+)">|<\/span>/g;
-	let lastIndex = 0;
-	let match: RegExpExecArray | null;
-
-	while ((match = tagRegex.exec(highlightedHtml)) !== null) {
-		const chunk = highlightedHtml.slice(lastIndex, match.index);
-		if (chunk) {
-			emitText(chunk);
-		}
-
-		if (match[0].startsWith("<span")) {
-			const cls = match[1]!;
-			const color = HLJS_TO_THEME_COLOR[cls] || "";
-			colorStack.push(color);
-		} else {
-			colorStack.pop();
-		}
-		lastIndex = tagRegex.lastIndex;
+	if (!cachedHighlighter) {
+		return code.split("\n");
 	}
-
-	const tail = highlightedHtml.slice(lastIndex);
-	if (tail) {
-		emitText(tail);
+	try {
+		const result = cachedHighlighter.codeToTokens(code, {
+			lang: "powershell",
+			theme: "omp-syntax",
+		});
+		return result.tokens.map(line =>
+			line
+				.map(token => {
+					const color = token.color;
+					if (color && color !== "default" && typeof theme.fg === "function") {
+						return theme.fg(color, token.content);
+					}
+					return token.content;
+				})
+				.join(""),
+		);
+	} catch {
+		return code.split("\n");
 	}
-
-	lines.push(currentLine);
-	return lines;
 }
 // ---------------------------------------------------------------------------
 // Eval-style frame builders: titled top bar, tee divider with label, rows,
