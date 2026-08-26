@@ -640,7 +640,7 @@ export function definePwshTool(pi: ExtensionAPI) {
 		parameters: z.object({
 			command: z.string().describe("PowerShell script to execute (multi-line / script blocks supported)"),
 			cwd: z.string().optional().describe("working directory; Set-Location inside the session may drift"),
-			env: z.object({ "[string]": z.string() }).optional().describe("extra environment variables (restored after execution)"),
+			env: z.record(z.string(), z.string()).optional().describe("extra environment variables (restored after execution)"),
 			format: z.enum(["text", "json"]).optional().describe("text=Out-String (default); json=ConvertTo-Json -Depth 100"),
 			width: z.number().optional().describe("Out-String width, default 200, range 40-4096"),
 			timeout: z.number().optional().describe(`timeout in seconds; 0 disables; default ${DEFAULT_TIMEOUT_SEC}; range ${MIN_TIMEOUT_SEC}-${MAX_TIMEOUT_SEC}`),

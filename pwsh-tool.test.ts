@@ -16,6 +16,7 @@ const zStub = {
 	number: schema,
 	enum: schema,
 	object: schema,
+	record: schema,
 };
 
 const theme = {
@@ -85,10 +86,43 @@ test("uses normal optional property names in the public tool schema", () => {
 			objectShapes.push(shape);
 			return node();
 		},
+		record: (..._args: unknown[]) => node(),
 	};
 
 	definePwshTool({ zod: z } as never);
 	expect(Object.keys(objectShapes.at(-1)!)).toEqual(["command", "cwd", "env", "format", "width", "timeout", "session"]);
+});
+test("defines env as a dynamic string record", () => {
+	let recordArgs: unknown[] | undefined;
+	const objectShapes: Array<Record<string, unknown>> = [];
+	const node = () => ({
+		optional() {
+			return this;
+		},
+		describe() {
+			return this;
+		},
+	});
+	const stringSchema = node();
+	const z = {
+		string: () => stringSchema,
+		number: node,
+		enum: node,
+		object(shape: Record<string, unknown>) {
+			objectShapes.push(shape);
+			return node();
+		},
+		record(...args: unknown[]) {
+			recordArgs = args;
+			return node();
+		},
+	};
+
+	definePwshTool({ zod: z } as never);
+	expect(recordArgs).toHaveLength(2);
+	expect(recordArgs?.[0]).toBe(stringSchema);
+	expect(recordArgs?.[1]).toBe(stringSchema);
+	expect(objectShapes.every(shape => !Object.hasOwn(shape, "[string]"))).toBe(true);
 });
 
 test("preserves deeply nested objects in JSON format", async () => {
@@ -107,6 +141,147 @@ test("preserves deeply nested objects in JSON format", async () => {
 		expect(value.Name).toBe("root");
 		expect(value.Icons.Child.Child).not.toBe("@{Level=4; Child=}");
 		expect(JSON.stringify(value)).toContain("preserve-me");
+	} finally {
+		pool.disposeAll();
+	}
+});
+test("restores overridden environment variables and removes temporary variables", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	const suffix = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+	const existingName = `OMP_PWSH_ENV_EXISTING_${suffix}`;
+	const missingName = `OMP_PWSH_ENV_MISSING_${suffix}`;
+	const session = pool.getOrCreate(`env-restore-${suffix}`, process.cwd());
+	const readEnv = (name: string) =>
+		`$item = Get-Item -Path ('Env:' + '${name}') -ErrorAction SilentlyContinue; if ($null -eq $item) { 'missing' } else { [string]$item.Value }`;
+
+	try {
+		const initialized = await session.run(
+			{
+				code: `Set-Item -Path ('Env:' + '${existingName}') -Value 'original-value'; Remove-Item -Path ('Env:' + '${missingName}') -ErrorAction SilentlyContinue; ${readEnv(existingName)}`,
+				format: "text",
+			},
+			{ timeoutMs: 30_000 },
+		);
+		expect(initialized.response?.output?.trim()).toBe("original-value");
+
+		const overridden = await session.run(
+			{ code: readEnv(existingName), env: { [existingName]: "temporary-value" }, format: "text" },
+			{ timeoutMs: 30_000 },
+		);
+		expect(overridden.response?.output?.trim()).toBe("temporary-value");
+
+		const restored = await session.run({ code: readEnv(existingName), format: "text" }, { timeoutMs: 30_000 });
+		expect(restored.response?.output?.trim()).toBe("original-value");
+
+		const temporary = await session.run(
+			{ code: readEnv(missingName), env: { [missingName]: "temporary-missing" }, format: "text" },
+			{ timeoutMs: 30_000 },
+		);
+		expect(temporary.response?.output?.trim()).toBe("temporary-missing");
+
+		const removed = await session.run({ code: readEnv(missingName), format: "text" }, { timeoutMs: 30_000 });
+		expect(removed.response?.output?.trim()).toBe("missing");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("restores the environment snapshot when request code overwrites runner state", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	const name = `OMP_PWSH_ENV_STATE_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+	const session = pool.getOrCreate(`env-state-restore-${name}`, process.cwd());
+	const readEnv = `Get-Item -Path ('Env:' + '${name}') | Select-Object -ExpandProperty Value`;
+
+	try {
+		await session.run({ code: `Set-Item -Path ('Env:' + '${name}') -Value 'original-value'`, format: "text" }, { timeoutMs: 30_000 });
+		const overridden = await session.run(
+			{ code: `$envState = @(); ${readEnv}`, env: { [name]: "temporary-value" }, format: "text" },
+			{ timeoutMs: 30_000 },
+		);
+		expect(overridden.response?.output?.trim()).toBe("temporary-value");
+
+		const restored = await session.run({ code: readEnv, format: "text" }, { timeoutMs: 30_000 });
+		expect(restored.response?.output?.trim()).toBe("original-value");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("does not expose any restore handle to request code", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	const name = `OMP_PWSH_RESTORE_HANDLE_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+	const session = pool.getOrCreate(`env-restore-handle-${name}`, process.cwd());
+	const readEnv = `Get-Item -Path ('Env:' + '${name}') -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Value`;
+
+	try {
+		await session.run({ code: `Set-Item -Path ('Env:' + '${name}') -Value 'original-value'`, format: "text" }, { timeoutMs: 30_000 });
+                const attempted = await session.run(
+                    {
+                        code: `
+$ErrorActionPreference = 'SilentlyContinue'
+$names = 'restoreDispatcher', 'restoreEnv', 'restoreStateModule', 'requestModule'
+foreach ($candidateName in $names) {
+    $candidate = Get-Variable -Name $candidateName -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $candidate) {
+        & $candidate -SetSnapshot @()
+        throw "restore handle is visible to request code: $candidateName"
+    }
+}
+$ErrorActionPreference = 'Continue'
+${readEnv}`,
+                        env: { [name]: "temporary-value" },
+                        format: "text",
+                    },
+                    { timeoutMs: 30_000 },
+                );
+		expect(attempted.response?.error ?? null).toBeNull();
+		expect(attempted.response?.output?.trim()).toBe("temporary-value");
+
+		const restored = await session.run({ code: readEnv, format: "text" }, { timeoutMs: 30_000 });
+		expect(restored.response?.output?.trim()).toBe("original-value");
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("does not carry a prior native exit code into an invalid env request", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	const session = pool.getOrCreate(`env-invalid-exit-${Date.now()}`, process.cwd());
+
+	try {
+		const nativeFailure = await session.run({ code: "cmd /c exit 17", format: "text" }, { timeoutMs: 30_000 });
+		expect(nativeFailure.response?.exitCode).toBe(17);
+
+		const invalid = await session.run(
+			{ code: "'must-not-run'", env: { "INVALID-ENV-KEY": "value" }, format: "text" },
+			{ timeoutMs: 30_000 },
+		);
+		expect(invalid.response?.error).toContain("invalid env key");
+		expect(invalid.response?.exitCode ?? null).toBeNull();
+		expect(invalid.response?.output ?? null).toBeNull();
+	} finally {
+		pool.disposeAll();
+	}
+});
+
+test("restores an environment variable once for case-insensitive duplicate keys", async () => {
+	const pool = new PwshSessionPool({ runnerPath: `${import.meta.dir}/runner.ps1` });
+	const session = pool.getOrCreate(`env-case-restore-${Date.now()}`, process.cwd());
+	const readPath = "Get-Item Env:Path | Select-Object -ExpandProperty Value";
+
+	try {
+		const original = await session.run({ code: readPath, format: "text" }, { timeoutMs: 30_000 });
+		const originalValue = original.response?.output?.trim();
+		expect(originalValue).toBeTruthy();
+
+		const overridden = await session.run(
+			{ code: readPath, env: { Path: "temporary-path", PATH: "temporary-path-upper" }, format: "text" },
+			{ timeoutMs: 30_000 },
+		);
+		expect(overridden.response?.output?.trim()).toBe("temporary-path-upper");
+
+		const restored = await session.run({ code: readPath, format: "text" }, { timeoutMs: 30_000 });
+		expect(restored.response?.output?.trim()).toBe(originalValue);
 	} finally {
 		pool.disposeAll();
 	}
@@ -297,7 +472,7 @@ const schema = () => ({
 	describe() { return this; },
 	optional() { return this; },
 });
-const zod = { string: schema, number: schema, enum: schema, object: schema };
+const zod = { string: schema, number: schema, enum: schema, object: schema, record: schema };
 const theme = { fg: (color, text) => \`[\${color}]\${text}[/\${color}]\` };
 let rendered = "";
 
