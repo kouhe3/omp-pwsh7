@@ -632,6 +632,8 @@ export function definePwshTool(pi: ExtensionAPI) {
 		label: "PowerShell 7",
 		description:
 			"Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats.",
+		// 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
+		loadMode: "essential" as const,
 		// Merge call+result into one frame like built-in tools: the pending call
 		// renders the command block; once the result lands the same slot redraws
 		// as the full frame (status title + command + output). Read by
