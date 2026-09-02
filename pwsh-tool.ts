@@ -811,8 +811,12 @@ export function definePwshTool(pi: ExtensionAPI) {
         };
       }
       const expanded = options.expanded === true;
+      const displayDetails = {
+        ...d,
+        timeoutSec: d.timeoutSec ?? normalizeTimeout(args?.timeout),
+      };
       const statusLabel = renderStatusLabel(
-        d,
+        displayDetails,
         result.isError === true,
         theme,
         options.isPartial === true,

@@ -684,6 +684,28 @@ test("prioritizes partial results over completed status", () => {
   expect(rendered).not.toContain("completed");
 });
 
+test("renders the default timeout while partial details are incomplete", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rendered = tool
+    .renderResult(
+      {
+        details: {
+          streaming: true,
+          wallTimeMs: 1,
+        } as never,
+      },
+      { expanded: false, isPartial: true },
+      theme,
+      { command: "Start-Sleep 1" },
+    )
+    .render(80)
+    .join("\n");
+
+  expect(rendered).toContain("running");
+  expect(rendered).toContain("Timeout: 120s");
+  expect(rendered).not.toContain("undefined");
+});
+
 test("renderCall renders process.cwd when cwd parameter is omitted", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const rendered = tool
