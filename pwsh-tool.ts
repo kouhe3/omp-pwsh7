@@ -95,25 +95,13 @@ export async function runPwsh(
   const cwdStat = await Bun.file(cwd)
     .stat()
     .catch(() => null);
-  if (!cwdStat) {
+  if (!cwdStat || !cwdStat.isDirectory()) {
+    const error = !cwdStat
+      ? `Working directory does not exist: ${cwd}`
+      : `Working directory is not a directory: ${cwd}`;
     return {
-      text: `Working directory does not exist: ${cwd}`,
-      details: emptyDetails(
-        params,
-        cwd,
-        `Working directory does not exist: ${cwd}`,
-      ),
-      isError: true,
-    };
-  }
-  if (!cwdStat.isDirectory()) {
-    return {
-      text: `Working directory is not a directory: ${cwd}`,
-      details: emptyDetails(
-        params,
-        cwd,
-        `Working directory is not a directory: ${cwd}`,
-      ),
+      text: error,
+      details: emptyDetails(params, cwd, error),
       isError: true,
     };
   }
@@ -592,15 +580,12 @@ function frameBottom(width: number, theme: Theme): string {
   );
 }
 
-/** Language icon for the title bar - nerd-font PowerShell glyph (nf-md-powershell). */
-function langIcon(): string {
-  return "\u{E86C}";
-}
+const LANG_ICON = "\u{E86C}";
 
 /** Titled bar text: accent icon + bright toolTitle text. */
 function frameTitle(theme: Theme, cwd?: string, extra?: string): string {
   const body = ` • PowerShell${cwd ? ` · ${cwd}` : ""}${extra ?? ""}`;
-  return `${theme.fg("accent", langIcon())}${theme.fg("toolTitle", body)}`;
+  return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
 }
 
 const PREVIEW_LINES_COLLAPSED = 6;
@@ -627,9 +612,8 @@ function renderStatusLabel(
   if (isPartial || d.streaming) {
     return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
   }
-  const exitBad =
-    d.exitCode !== null && d.exitCode !== undefined && d.exitCode !== 0;
-  const bad = isError || exitBad;
+  const hasExitCode = d.exitCode != null && d.exitCode !== 0;
+  const bad = isError || hasExitCode;
   const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";
   const state = d.dead
     ? "process died"
@@ -645,10 +629,7 @@ function renderStatusLabel(
       : bad
         ? "error"
         : "success";
-  const exitText =
-    d.exitCode !== null && d.exitCode !== undefined && d.exitCode !== 0
-      ? ` · exit ${d.exitCode}`
-      : "";
+  const exitText = hasExitCode ? ` · exit ${d.exitCode}` : "";
   return `${theme.fg(color, icon)} ${state}${exitText} · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
 }
 
@@ -699,12 +680,15 @@ function renderBody(
   // Out-String pads leading/trailing blank lines (CRLF frames); trim both
   // ends and collapse interior blank runs so the preview is compact.
   const raw = body.split("\n");
-  while (raw.length > 0 && raw[0]!.trim() === "") raw.shift();
-  while (raw.length > 0 && raw[raw.length - 1]!.trim() === "") raw.pop();
+  let start = 0;
+  while (start < raw.length && raw[start]!.trim() === "") start++;
+  let end = raw.length;
+  while (end > start && raw[end - 1]!.trim() === "") end--;
+  const trimmed = raw.slice(start, end);
   const bodyLines: string[] = [];
   let prevBlank = false;
   const maxBodyWidth = Math.max(1, frameInnerWidth(width) - 2);
-  for (const line of raw) {
+  for (const line of trimmed) {
     const blank = line.trim() === "";
     if (blank && prevBlank) continue;
     prevBlank = blank;

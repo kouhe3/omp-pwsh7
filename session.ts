@@ -158,22 +158,20 @@ export class PwshSession {
         ).slice(-STDERR_TAIL_CHARS);
       });
     }
-    proc.exited.then(
-      () => {
-        if (this.#proc !== proc) return; // superseded by a respawned proc
-        this.#emitExit();
-        this.#dead = true;
-        this.#rejectAll(new Error("pwsh process exited"));
-      },
-      // Async spawn failure (no stdio pipes requested): `exited` rejects.
-      (err: unknown) => {
-        if (this.#proc !== proc) return; // superseded by a respawned proc
-        this.#emitExit();
-        this.#dead = true;
+    const handleExit = (err?: unknown) => {
+      if (this.#proc !== proc) return; // superseded by a respawned proc
+      this.#emitExit();
+      this.#dead = true;
+      if (err !== undefined) {
         this.#lastError = err instanceof Error ? err.message : String(err);
-        this.#rejectAll(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
+      }
+      const exitErr =
+        err instanceof Error
+          ? err
+          : new Error(this.#lastError ?? "pwsh process exited");
+      this.#rejectAll(exitErr);
+    };
+    proc.exited.then(() => handleExit(), handleExit);
   }
 
   /** Pull chunks from a piped Subprocess stream until it closes. */
@@ -281,14 +279,9 @@ export class PwshSession {
           windowsHide: true,
         },
       );
-      killer.exited.then(
-        () => {
-          if (this.#proc === live) this.#proc = null;
-        },
-        () => {
-          if (this.#proc === live) this.#proc = null;
-        },
-      );
+      killer.exited.finally(() => {
+        if (this.#proc === live) this.#proc = null;
+      });
       // Fallback: direct kill if taskkill fails to deliver within grace.
       setTimeout(() => {
         if (this.#proc === live) {
@@ -410,10 +403,7 @@ export class PwshSession {
         },
       );
       await new Promise<void>((res) => {
-        killer.exited.then(
-          () => res(),
-          () => res(),
-        );
+        killer.exited.finally(res);
         setTimeout(res, KILL_GRACE_MS).unref();
       });
     }
