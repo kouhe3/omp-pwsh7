@@ -8,9 +8,9 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { definePwshTool, getHighlighterInstance } from "./pwsh-tool";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-	pi.setLabel("PowerShell 7");
-	// Tool renderers are synchronous; finish the async Shiki preload before
-	// exposing the tool so its first pending frame is syntax-highlighted.
-	await getHighlighterInstance().catch(() => {});
-	pi.registerTool(definePwshTool(pi));
+  pi.setLabel("PowerShell 7");
+  // Tool renderers are synchronous; finish the async Shiki preload before
+  // exposing the tool so its first pending frame is syntax-highlighted.
+  await getHighlighterInstance().catch(() => {});
+  pi.registerTool(definePwshTool(pi));
 }

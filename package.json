@@ -14,9 +14,9 @@
     "shiki": "^4.4.3"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "^18.0.1",
+    "@oh-my-pi/pi-coding-agent": "^18.1.2",
     "@types/bun": "^1.4.0",
-    "@types/node": "^26.2.0",
-    "typescript": "^7"
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
   }
 }
