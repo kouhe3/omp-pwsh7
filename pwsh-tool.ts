@@ -647,7 +647,8 @@ function commandBlock(
   running: boolean,
   closed = true,
 ): string[] {
-  const title = frameTitle(theme, cwd, running ? " · executing…" : "");
+  const effectiveCwd = cwd || process.cwd();
+  const title = frameTitle(theme, effectiveCwd, running ? " · executing…" : "");
   const out: string[] = [frameTop(width, theme, title)];
   let highlighted: string[];
   try {
@@ -783,7 +784,7 @@ export function definePwshTool(pi: ExtensionAPI) {
             theme,
             width,
             args.command ?? "",
-            args.cwd,
+            args.cwd ?? process.cwd(),
             options.spinnerFrame !== undefined,
           ),
       };
@@ -804,7 +805,7 @@ export function definePwshTool(pi: ExtensionAPI) {
               theme,
               width,
               args?.command ?? "",
-              args?.cwd,
+              args?.cwd ?? process.cwd(),
               options.spinnerFrame !== undefined,
             ),
         };
@@ -826,7 +827,7 @@ export function definePwshTool(pi: ExtensionAPI) {
             theme,
             width,
             args?.command ?? "",
-            d.cwd,
+            d.cwd || args?.cwd || process.cwd(),
             false,
             false,
           );

@@ -683,3 +683,56 @@ test("prioritizes partial results over completed status", () => {
   expect(rendered).toContain("running");
   expect(rendered).not.toContain("completed");
 });
+
+test("renderCall renders process.cwd when cwd parameter is omitted", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rendered = tool
+    .renderCall({ command: "Get-Date" }, { spinnerFrame: 0 }, theme)
+    .render(120)
+    .join("\n");
+
+  expect(rendered).toContain(process.cwd());
+  expect(rendered).toContain("executing…");
+});
+
+test("renderCall renders explicit cwd when provided in parameters", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const customCwd = "D:\\CustomProject";
+  const rendered = tool
+    .renderCall(
+      { command: "Get-Date", cwd: customCwd },
+      { spinnerFrame: 0 },
+      theme,
+    )
+    .render(120)
+    .join("\n");
+
+  expect(rendered).toContain(customCwd);
+  expect(rendered).toContain("executing…");
+});
+
+test("renderResult renders process.cwd before details arrive in pending state", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rendered = tool
+    .renderResult({}, { spinnerFrame: 1 }, theme, { command: "Get-Date" })
+    .render(120)
+    .join("\n");
+
+  expect(rendered).toContain(process.cwd());
+  expect(rendered).toContain("executing…");
+});
+
+test("renderResult renders explicit cwd before details arrive in pending state", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const customCwd = "D:\\ExplicitDir";
+  const rendered = tool
+    .renderResult({}, { spinnerFrame: 1 }, theme, {
+      command: "Get-Date",
+      cwd: customCwd,
+    })
+    .render(120)
+    .join("\n");
+
+  expect(rendered).toContain(customCwd);
+  expect(rendered).toContain("executing…");
+});
