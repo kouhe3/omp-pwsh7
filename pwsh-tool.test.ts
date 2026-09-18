@@ -56,6 +56,32 @@ test("renders the complete long command instead of replacing its tail with an el
   expect(commandRows.join("")).toBe(command);
 });
 
+test("renders multi-line here-string commands completely when expanded", () => {
+  const command = String.raw`$json = @"
+{
+  "a": 1
+}
+"@
+Invoke-RestMethod -Method Post -Uri https://example.com/api -Body $json`;
+  const tool = definePwshTool({ zod: zStub } as never);
+  const ansi = /\x1b\[[0-9;]*m/g;
+  const collapsed = tool
+    .renderCall({ command }, {}, theme)
+    .render(80)
+    .join("\n")
+    .replace(ansi, "");
+  const expanded = tool
+    .renderCall({ command }, { expanded: true }, theme)
+    .render(80)
+    .join("\n")
+    .replace(ansi, "");
+
+  expect(collapsed).toContain("more lines (ctrl+o to expand)");
+  expect(expanded).not.toContain("more lines (ctrl+o to expand)");
+  expect(expanded).toContain('"@');
+  expect(expanded).toContain("Invoke-RestMethod -Method Post");
+});
+
 test("keeps the complete reported command tail visible after wrapping", () => {
   const command =
     "$items = 1..8 | ForEach-Object { Start-Sleep -Milliseconds 500; [pscustomobject]@{Step = $_; Timestamp = Get-Date -Format 'HH:mm:ss.fff'} }; $items | Format-Table -AutoSize | Out-String";

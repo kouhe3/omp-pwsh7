@@ -633,8 +633,14 @@ function renderStatusLabel(
   return `${theme.fg(color, icon)} ${state}${exitText} · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
 }
 
+/** Command source lines shown before collapsing behind a ctrl+o hint. */
+const COMMAND_PREVIEW_LINES = 4;
+
 /**
- * Command block rows: wrapped highlighted command lines, up to four source lines.
+ * Command block rows: wrapped highlighted command lines. Collapsed shows the
+ * first `COMMAND_PREVIEW_LINES` source lines plus a hint for the rest;
+ * expanded shows every line - multi-line scripts (here-strings, script
+ * blocks) used to stop dead after line four with no indication.
  * Shared by renderCall and renderResult (pending + merged frames).
  * `closed: false` leaves the frame open (no bottom bar) so a merged
  * renderResult can follow with the status divider + output + single bottom.
@@ -646,20 +652,36 @@ function commandBlock(
   cwd: string | undefined,
   running: boolean,
   closed = true,
+  expanded = false,
 ): string[] {
   const effectiveCwd = cwd || process.cwd();
   const title = frameTitle(theme, effectiveCwd, running ? " · executing…" : "");
   const out: string[] = [frameTop(width, theme, title)];
-  let highlighted: string[];
+  let lines: string[];
   try {
-    highlighted = highlightPowerShell(command, theme).slice(0, 4);
+    lines = highlightPowerShell(command, theme);
   } catch {
-    highlighted = command.split("\n").slice(0, 4);
+    lines = command.split("\n");
   }
+  // A trailing newline in the submitted command is not a command line.
+  while (lines.length > 1 && lines[lines.length - 1]!.trim() === "") lines.pop();
+  const visibleCount = expanded
+    ? lines.length
+    : Math.min(lines.length, COMMAND_PREVIEW_LINES);
   const maxCommandWidth = Math.max(1, frameInnerWidth(width) - 2);
-  for (const line of highlighted) {
+  for (const line of lines.slice(0, visibleCount)) {
     for (const wrapped of wrapAnsiLine(line, maxCommandWidth))
       out.push(frameRow(wrapped, width, theme));
+  }
+  const hiddenLines = lines.length - visibleCount;
+  if (hiddenLines > 0) {
+    out.push(
+      frameRow(
+        theme.fg("dim", `… ${hiddenLines} more lines (ctrl+o to expand)`),
+        width,
+        theme,
+      ),
+    );
   }
   if (closed) out.push(frameBottom(width, theme));
   return out;
@@ -786,6 +808,8 @@ export function definePwshTool(pi: ExtensionAPI) {
             args.command ?? "",
             args.cwd ?? process.cwd(),
             options.spinnerFrame !== undefined,
+            true,
+            options.expanded === true,
           ),
       };
     },
@@ -807,6 +831,8 @@ export function definePwshTool(pi: ExtensionAPI) {
               args?.command ?? "",
               args?.cwd ?? process.cwd(),
               options.spinnerFrame !== undefined,
+              true,
+              options.expanded === true,
             ),
         };
       }
@@ -834,6 +860,7 @@ export function definePwshTool(pi: ExtensionAPI) {
             d.cwd || args?.cwd || process.cwd(),
             false,
             false,
+            expanded,
           );
           // Status + timing divider
           out.push(frameDivider(width, theme, statusLabel));
