@@ -6,6 +6,11 @@
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+// Host-owned pi-tui instance (OMP rewrites every `@oh-my-pi/pi-*` specifier in
+// extension sources to the module it already has loaded). Required because the
+// framed-block mark is a module-private Symbol: a copy from our own
+// node_modules would mark the component with a symbol the host never checks.
+import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import { createHighlighter, type HighlighterGeneric } from "shiki";
 import { PwshSessionPool, type PwshRunResult } from "./session";
 
@@ -800,7 +805,7 @@ export function definePwshTool(pi: ExtensionAPI) {
       }
     },
     renderCall(args: PwshParams, options: PwshRenderOptions, theme: Theme) {
-      return {
+      return markFramedBlockComponent({
         render: (width: number) =>
           commandBlock(
             theme,
@@ -811,7 +816,7 @@ export function definePwshTool(pi: ExtensionAPI) {
             true,
             options.expanded === true,
           ),
-      };
+      });
     },
     renderResult(
       result: PwshRenderResult,
@@ -823,7 +828,7 @@ export function definePwshTool(pi: ExtensionAPI) {
       if (!d) {
         // Partial/pending result (onUpdate fired, no details yet): keep the
         // command block visible instead of an empty frame.
-        return {
+        return markFramedBlockComponent({
           render: (width: number) =>
             commandBlock(
               theme,
@@ -834,7 +839,7 @@ export function definePwshTool(pi: ExtensionAPI) {
               true,
               options.expanded === true,
             ),
-        };
+        });
       }
       const expanded = options.expanded === true;
       const displayDetails = {
@@ -847,7 +852,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         theme,
         options.isPartial === true,
       );
-      return {
+      return markFramedBlockComponent({
         render: (width: number) => {
           const bodyLines = renderBody(d, expanded, theme, width);
           // Command block (merged frame, like built-in tools) - left open
@@ -878,7 +883,7 @@ export function definePwshTool(pi: ExtensionAPI) {
           out.push(frameBottom(width, theme));
           return out;
         },
-      };
+      });
     },
   };
 }
