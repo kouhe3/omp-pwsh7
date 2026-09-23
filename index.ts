@@ -5,10 +5,12 @@
  * 实现：持久 `pwsh -File runner.ps1` 子进程 + 行协议（base64 JSON）。
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { definePwshTool, getHighlighterInstance } from "./pwsh-tool";
+import { TOOL_LABEL } from "./card";
+import { definePwshTool } from "./pwsh-tool";
+import { getHighlighterInstance } from "./syntax";
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-  pi.setLabel("PowerShell 7");
+  pi.setLabel(TOOL_LABEL);
   // Tool renderers are synchronous; finish the async Shiki preload before
   // exposing the tool so its first pending frame is syntax-highlighted.
   await getHighlighterInstance().catch(() => {});

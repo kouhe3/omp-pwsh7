@@ -1,11 +1,8 @@
 import { expect, test } from "bun:test";
-import {
-  definePwshTool,
-  getHighlighterInstance,
-  highlightPowerShell,
-  runPwsh,
-} from "./pwsh-tool";
+import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
+import { definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
+import { getHighlighterInstance, highlightPowerShell } from "./syntax";
 
 const schema = () => ({
   describe() {
@@ -39,7 +36,8 @@ const theme = {
 
 function renderCommand(command: string, width: number): string[] {
   const tool = definePwshTool({ zod: zStub } as never);
-  return tool.renderCall({ command }, {}, theme).render(width);
+  // Frame assertions describe the completed-args state; the pending row is covered separately.
+  return tool.renderCall({ command }, { argsComplete: true }, theme).render(width);
 }
 
 test("renders the complete long command instead of replacing its tail with an ellipsis", () => {
@@ -66,12 +64,12 @@ Invoke-RestMethod -Method Post -Uri https://example.com/api -Body $json`;
   const tool = definePwshTool({ zod: zStub } as never);
   const ansi = /\x1b\[[0-9;]*m/g;
   const collapsed = tool
-    .renderCall({ command }, {}, theme)
+    .renderCall({ command }, { argsComplete: true }, theme)
     .render(80)
     .join("\n")
     .replace(ansi, "");
   const expanded = tool
-    .renderCall({ command }, { expanded: true }, theme)
+    .renderCall({ command }, { argsComplete: true, expanded: true }, theme)
     .render(80)
     .join("\n")
     .replace(ansi, "");
@@ -133,6 +131,7 @@ test("uses normal optional property names in the public tool schema", () => {
 
   definePwshTool({ zod: z } as never);
   expect(Object.keys(objectShapes.at(-1)!)).toEqual([
+    "i",
     "command",
     "cwd",
     "env",
@@ -437,7 +436,13 @@ test("streams text output before the command completes", async () => {
 
     const firstOutput = updates.find((update) => update.text.includes("first"));
     expect(firstOutput).toBeDefined();
-    expect(firstOutput!.elapsedMs).toBeLessThan(1000);
+    // The chunk must land inside the command's own 600ms sleep window, i.e. while
+    // it is still running. Relative to the run's wall time so a slow machine scales
+    // both sides instead of failing an absolute millisecond budget (this test used
+    // to fail on a cold pwsh while passing in-suite).
+    expect(firstOutput!.elapsedMs).toBeLessThan(
+      Math.max(0, (result.details.wallTimeMs ?? 0) - 400),
+    );
     expect(updates.at(-1)?.text).toContain("second");
     expect(result.text).toContain("first");
     expect(result.text).toContain("second");
@@ -507,10 +512,13 @@ test("returns streamed output when a command times out", async () => {
     );
     const result = await session.run(
       {
-        code: "Write-Output 'before-timeout'; Start-Sleep -Seconds 3",
+        code: "Write-Output 'before-timeout'; Start-Sleep -Seconds 5",
         format: "text",
       },
-      { timeoutMs: 700 },
+      // Wide enough that the first chunk has landed even on a cold pwsh start
+      // (700ms was racing the spawn when this ran standalone), still well inside
+      // the command's own sleep so the kill lands mid-command.
+      { timeoutMs: 2000 },
     );
 
     expect(result.timedOut).toBe(true);
@@ -650,10 +658,10 @@ test("highlightPowerShell correctly tokenizes git branch commands", async () => 
 });
 test("registers the tool after cold-start highlighter initialization", async () => {
   const indexUrl = new URL("./index.ts", import.meta.url).href;
-  const toolUrl = new URL("./pwsh-tool.ts", import.meta.url).href;
+  const syntaxUrl = new URL("./syntax.ts", import.meta.url).href;
   const childSource = `
 import registerPwsh from ${JSON.stringify(indexUrl)};
-import { highlightPowerShell } from ${JSON.stringify(toolUrl)};
+import { highlightPowerShell } from ${JSON.stringify(syntaxUrl)};
 
 const schema = () => ({
 	describe() { return this; },
@@ -732,55 +740,265 @@ test("renders the default timeout while partial details are incomplete", () => {
   expect(rendered).not.toContain("undefined");
 });
 
-test("renderCall renders process.cwd when cwd parameter is omitted", () => {
+test("renderCall stays an inline pending row while the arguments are still streaming", () => {
   const tool = definePwshTool({ zod: zStub } as never);
-  const rendered = tool
-    .renderCall({ command: "Get-Date" }, { spinnerFrame: 0 }, theme)
-    .render(120)
-    .join("\n");
+  const component = tool.renderCall(
+    { i: "List large files", command: "Get-Chil" },
+    { argsComplete: false },
+    theme,
+  );
+  const rows = component.render(120);
 
-  expect(rendered).toContain(process.cwd());
-  expect(rendered).toContain("executing…");
+  // One grep/glob-style row: the host adds no padding or state tint of its own.
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.startsWith(" ")).toBe(true);
+  expect(isFramedBlockComponent(component)).toBe(true);
+  expect(rows[0]).toContain("List large files");
+  expect(rows.join("\n")).not.toContain("╭");
+  expect(rows.join("\n")).not.toContain("Get-Chil");
 });
 
-test("renderCall renders explicit cwd when provided in parameters", () => {
+test("renderCall draws the frame with the model intent once args are complete", () => {
   const tool = definePwshTool({ zod: zStub } as never);
-  const customCwd = "D:\\CustomProject";
   const rendered = tool
     .renderCall(
-      { command: "Get-Date", cwd: customCwd },
-      { spinnerFrame: 0 },
+      { i: "List large files", command: "Get-Date" },
+      { argsComplete: true },
       theme,
     )
     .render(120)
     .join("\n");
 
-  expect(rendered).toContain(customCwd);
-  expect(rendered).toContain("executing…");
+  expect(rendered).toContain("╭");
+  expect(rendered).toContain("List large files");
+  expect(rendered).not.toContain("PowerShell 7");
+  // Liveness lives on the status divider (`● running`), not in the title.
+  expect(rendered).not.toContain("executing…");
 });
 
-test("renderResult renders process.cwd before details arrive in pending state", () => {
+test("renderCall falls back to the tool label when the model declared no intent", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const rendered = tool
-    .renderResult({}, { spinnerFrame: 1 }, theme, { command: "Get-Date" })
+    .renderCall({ command: "Get-Date" }, { argsComplete: true }, theme)
     .render(120)
     .join("\n");
 
-  expect(rendered).toContain(process.cwd());
-  expect(rendered).toContain("executing…");
+  expect(rendered).toContain("PowerShell 7");
 });
 
-test("renderResult renders explicit cwd before details arrive in pending state", () => {
+test("a multi-line intent cannot split a card row", () => {
   const tool = definePwshTool({ zod: zStub } as never);
+  const intent = "List\nlarge files";
+  const pending = tool
+    .renderCall({ i: intent, command: "Get-Chil" }, { argsComplete: false }, theme)
+    .render(60);
+  const settled = tool
+    .renderResult(
+      {
+        details: {
+          cwd: "D:\\SessionCwd",
+          sessionKey: "D:\\SessionCwd\n",
+          format: "text" as const,
+          timeoutSec: 120,
+          wallTimeMs: 12,
+          exitCode: 0,
+          output: "ok\n",
+        },
+      },
+      { expanded: true },
+      theme,
+      { i: intent, command: "Get-ChildItem" },
+    )
+    .render(60);
+
+  // A newline inside a rendered row splits the frame in the terminal, so the
+  // intent is flattened the way the host flattens its own status rows.
+  expect(pending).toHaveLength(1);
+  expect(pending.filter((row) => row.includes("\n"))).toEqual([]);
+  expect(settled.filter((row) => row.includes("\n"))).toEqual([]);
+  expect(pending.join("\n")).toContain("List large files");
+});
+
+test("renderCall shows a working directory only when the call asked for one", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const render = (cwd?: string) =>
+    tool
+      .renderCall(
+        cwd === undefined ? { command: "Get-Date" } : { command: "Get-Date", cwd },
+        { argsComplete: true },
+        theme,
+      )
+      .render(120)
+      .join("\n");
+
+  // Same rule as the built-in bash card: the session directory is implied, so
+  // asking for it explicitly must render exactly like not asking at all.
+  expect(render()).not.toContain(process.cwd());
+  expect(render(process.cwd())).toBe(render());
+  // Inside the project the title carries the relative path, outside it the
+  // shortened absolute one.
+  expect(render("dev")).toContain("· dev");
+  expect(render("D:\\CustomProject")).toContain("· D:\\CustomProject");
+});
+
+test("renderResult before details arrive shows cwd only when the call asked for one", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const withoutCwd = tool
+    .renderResult({}, {}, theme, { command: "Get-Date" })
+    .render(120)
+    .join("\n");
   const customCwd = "D:\\ExplicitDir";
-  const rendered = tool
-    .renderResult({}, { spinnerFrame: 1 }, theme, {
-      command: "Get-Date",
-      cwd: customCwd,
-    })
+  const withCwd = tool
+    .renderResult({}, {}, theme, { command: "Get-Date", cwd: customCwd })
     .render(120)
     .join("\n");
 
-  expect(rendered).toContain(customCwd);
-  expect(rendered).toContain("executing…");
+  expect(withoutCwd).not.toContain(process.cwd());
+  expect(withCwd).toContain(customCwd);
+});
+
+test("renderResult titles the merged card with the intent and no cwd the call did not ask for", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const details = {
+    cwd: "D:\\SessionCwd",
+    sessionKey: "D:\\SessionCwd\n",
+    format: "text" as const,
+    timeoutSec: 120,
+    wallTimeMs: 42,
+    exitCode: 0,
+    output: "42\n",
+  };
+  const rendered = tool
+    .renderResult(
+      { details },
+      { expanded: false },
+      theme,
+      { i: "Read a missing path", command: "Get-Date" },
+    )
+    .render(120)
+    .join("\n");
+
+  expect(rendered).toContain("Read a missing path");
+  expect(rendered).not.toContain("PowerShell 7");
+  // Neither the session cwd nor process.cwd() may leak into the title.
+  expect(rendered).not.toContain(details.cwd);
+  expect(rendered).not.toContain(process.cwd());
+});
+
+test("keeps the streamed intent after the host strips it from the reconciled args", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  // One render-state object per card, shared by renderCall and renderResult and
+  // mutated in place by the host. The merged card receives the args validated at
+  // execution start, which no longer carry `i` (intent tracing strips it), so the
+  // title has to come from what the streaming call already saw.
+  const options = { expanded: false, argsComplete: false };
+  const streamed = tool
+    .renderCall(
+      { i: "List large files", command: "Get-ChildItem" },
+      options,
+      theme,
+    )
+    .render(100);
+  options.argsComplete = true;
+  const merged = tool
+    .renderResult(
+      {
+        details: {
+          cwd: "D:\\SessionCwd",
+          sessionKey: "D:\\SessionCwd\n",
+          format: "text",
+          timeoutSec: 120,
+          wallTimeMs: 12,
+          exitCode: 0,
+          output: "ok\n",
+        },
+      },
+      options,
+      theme,
+      { command: "Get-ChildItem" },
+    )
+    .render(100)
+    .join("\n");
+
+  expect(streamed.join("\n")).toContain("List large files");
+  expect(merged).toContain("List large files");
+  expect(merged).not.toContain("PowerShell 7");
+});
+
+test("the completed command frame is marked as a framed block", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const component = tool.renderCall(
+    { i: "List large files", command: "Get-Date" },
+    { argsComplete: true },
+    theme,
+  );
+
+  expect(isFramedBlockComponent(component)).toBe(true);
+});
+
+test("an absent argsComplete flag still renders the pending row", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rows = tool
+    .renderCall({ i: "List large files", command: "Get-Date" }, {}, theme)
+    .render(120);
+
+  expect(rows).toHaveLength(1);
+  expect(rows.join("\n")).not.toContain("╭");
+});
+
+test("every frame row occupies the same number of columns", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const payloads = [
+    "plain ascii line\nsecond line\n",
+    "中文目录名 ✅ 🐈 12.34 2026/9/23\n下一行\n",
+    `${"x".repeat(200)}\nemoji 🐈 mid-line ${"y".repeat(40)}\n`,
+  ];
+  const cases = [
+    ...payloads.map((output) => ({ output, intent: undefined as string | undefined })),
+    // A model-authored intent longer than the frame is the case that used to
+    // floor `frameTop`'s fill at 0 and push the top bar past the right corner.
+    { output: payloads[0]!, intent: "Explain why the deployment script keeps failing ".repeat(3) },
+  ];
+  // 40 columns is narrower than the status label (`✓ completed · Wall: … |
+  // Timeout: 120s`), which is what made the divider row overflow.
+  for (const width of [60, 40]) {
+    for (const { output, intent } of cases) {
+      const rows = tool
+        .renderResult(
+          {
+            details: {
+              cwd: "D:\\SessionCwd",
+              sessionKey: "D:\\SessionCwd\n",
+              format: "text",
+              timeoutSec: 120,
+              wallTimeMs: 12,
+              exitCode: 0,
+              output,
+            },
+          },
+          { expanded: true },
+          theme,
+          { i: intent, command: "Get-Date" },
+        )
+        .render(width);
+      const widths = rows.map((row) => Bun.stringWidth(row, { countAnsiEscapeCodes: false }));
+
+      expect(new Set(widths).size).toBe(1);
+      // No row may be wider than the box the host allocated for the component.
+      expect(Math.max(...widths)).toBeLessThanOrEqual(width);
+    }
+  }
+});
+
+test("renderCall survives a non-string intent from the streamed args", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const pending = tool
+    .renderCall({ i: 1 as never, command: "Get-Da" }, { argsComplete: false }, theme)
+    .render(60);
+  const complete = tool
+    .renderCall({ i: { text: "x" } as never, command: "Get-Date" }, { argsComplete: true }, theme)
+    .render(60);
+
+  expect(pending.join("\n")).toContain("PowerShell 7");
+  expect(complete.join("\n")).toContain("PowerShell 7");
 });

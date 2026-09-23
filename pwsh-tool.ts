@@ -4,6 +4,7 @@
  * One long-lived `pwsh -File runner.ps1` subprocess per (cwd, session) key.
  * State (variables, modules, location) survives across calls, so module
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
+ * Card rendering lives in `card.ts`, syntax highlighting in `syntax.ts`.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 // Host-owned pi-tui instance (OMP rewrites every `@oh-my-pi/pi-*` specifier in
@@ -11,7 +12,16 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 // framed-block mark is a module-private Symbol: a copy from our own
 // node_modules would mark the component with a symbol the host never checks.
 import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
-import { createHighlighter, type HighlighterGeneric } from "shiki";
+import {
+  TOOL_LABEL,
+  callTitle,
+  commandBlock,
+  renderCard,
+  renderPendingRow,
+  type PwshRenderOptions,
+  type PwshRenderResult,
+  type Theme,
+} from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
 
 const DEFAULT_TIMEOUT_SEC = 120;
@@ -24,6 +34,12 @@ const STREAM_PREVIEW_CHARS = 50 * 1024;
 
 export interface PwshParams {
   command: string;
+  /**
+   * Model-declared intent (`INTENT_FIELD`), the harness-wide `i` argument: a
+   * capitalized 2-6 word present participle. It becomes the card title, so the
+   * header describes what the call is doing instead of naming the tool.
+   */
+  i?: string;
   cwd?: string;
   env?: Record<string, string>;
   format?: "text" | "json";
@@ -257,489 +273,16 @@ function normalizeWidth(value: number | undefined): number {
 }
 
 // ---------------------------------------------------------------------------
-// TUI renderer - framed block + syntax highlighting via host-injected pi.pi
-// (duck-typed Component; host instance avoids the pi-tui dual-copy trap)
+// Tool definition: schema, execution, and the render hooks that draw the card
+// through `card.ts` (host instance of pi-tui, see the import at the top).
 // ---------------------------------------------------------------------------
-
-interface Theme {
-  fg(color: string, text: string): string;
-  bg?(color: string, text: string): string;
-  bold?(text: string): string;
-  styledSymbol?(key: string, color: string): string;
-  boxRound?: {
-    topLeft: string;
-    topRight: string;
-    bottomLeft: string;
-    bottomRight: string;
-    horizontal: string;
-    vertical: string;
-  };
-  boxSharp?: {
-    teeLeft: string;
-    teeRight: string;
-    horizontal: string;
-  };
-}
-
-/** Terminal column width of one char: East Asian wide/fullwidth = 2. */
-function charWidth(ch: string): number {
-  const c = ch.codePointAt(0) ?? 0;
-  if (
-    (c >= 0x1100 && c <= 0x115f) || // Hangul Jamo
-    (c >= 0x2e80 && c <= 0xa4cf) || // CJK radicals .. Yi
-    (c >= 0xac00 && c <= 0xd7a3) || // Hangul syllables
-    (c >= 0xf900 && c <= 0xfaff) || // CJK compat ideographs
-    (c >= 0xfe30 && c <= 0xfe6f) || // CJK compat forms
-    (c >= 0xff00 && c <= 0xff60) || // Fullwidth forms
-    (c >= 0xffe0 && c <= 0xffe6) // Fullwidth signs
-  ) {
-    return 2;
-  }
-  return 1;
-}
-
-/** Strip ANSI escapes to measure visible width (wide chars = 2 columns). */
-function visibleLength(text: string): number {
-  let visible = 0;
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "\x1b") {
-      const end = text.indexOf("m", i);
-      if (end === -1) break;
-      i = end + 1;
-    } else {
-      visible += charWidth(text[i]!);
-      i++;
-    }
-  }
-  return visible;
-}
-
-/** Slice a possibly-ANSI-colored string to `max` visible columns, preserving escapes. */
-function ansiSafeSlice(text: string, max: number): string {
-  let visible = 0;
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "\x1b") {
-      const end = text.indexOf("m", i);
-      if (end === -1) {
-        out += text.slice(i);
-        break;
-      }
-      out += text.slice(i, end + 1);
-      i = end + 1;
-      continue;
-    }
-    if (visible >= max) break;
-    const w = charWidth(text[i]!);
-    if (visible + w > max) break;
-    out += text[i]!;
-    visible += w;
-    i++;
-  }
-  if (i < text.length) out += "…";
-  return out;
-}
-
-/** Wrap ANSI-colored text into terminal-width rows without dropping characters. */
-function wrapAnsiLine(text: string, max: number): string[] {
-  if (max <= 0) return [text];
-  const rows: string[] = [];
-  let row = "";
-  let visible = 0;
-  let activeSgr = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "\x1b") {
-      const end = text.indexOf("m", i);
-      if (end === -1) {
-        row += text.slice(i);
-        break;
-      }
-      const sequence = text.slice(i, end + 1);
-      row += sequence;
-      if (sequence.startsWith("\x1b[")) {
-        const params = sequence.slice(2, -1).split(";").filter(Boolean);
-        if (
-          params.length === 0 ||
-          params.some(
-            (param) => param === "0" || param === "39" || param === "49",
-          )
-        ) {
-          activeSgr = "";
-        } else {
-          activeSgr += sequence;
-        }
-      }
-      i = end + 1;
-      continue;
-    }
-
-    const codePoint = text.codePointAt(i) ?? 0;
-    const char = String.fromCodePoint(codePoint);
-    const width = charWidth(char);
-    if (visible > 0 && visible + width > max) {
-      if (activeSgr) row += "\x1b[0m";
-      rows.push(row);
-      row = activeSgr;
-      visible = 0;
-    }
-    row += char;
-    visible += width;
-    i += char.length;
-  }
-  if (activeSgr) row += "\x1b[0m";
-  if (row || rows.length === 0) rows.push(row);
-  return rows;
-}
-
-// ---------------------------------------------------------------------------
-// PowerShell syntax highlighter via Shiki (TextMate grammar).
-//
-// Uses Shiki's TextMate engine with a custom theme mapping TextMate scopes
-// (comments, strings, variables, cmdlets, operators, numbers, types, etc.)
-// to OMP theme semantic colors (syntaxComment, syntaxString, syntaxFunction...).
-// ---------------------------------------------------------------------------
-
-export const OMP_SYNTAX_THEME = {
-  name: "omp-syntax",
-  type: "dark" as const,
-  fg: "default",
-  bg: "transparent",
-  settings: [
-    {
-      scope: ["comment", "punctuation.definition.comment"],
-      settings: { foreground: "syntaxComment" },
-    },
-    {
-      scope: ["string", "punctuation.definition.string", "string.quoted"],
-      settings: { foreground: "syntaxString" },
-    },
-    {
-      scope: [
-        "variable",
-        "support.variable",
-        "punctuation.definition.variable",
-      ],
-      settings: { foreground: "syntaxVariable" },
-    },
-    {
-      scope: ["keyword", "storage.type", "storage.modifier", "keyword.control"],
-      settings: { foreground: "syntaxKeyword" },
-    },
-    {
-      scope: ["keyword.operator"],
-      settings: { foreground: "syntaxOperator" },
-    },
-    {
-      scope: [
-        "entity.name.function",
-        "support.function",
-        "entity.name.command",
-      ],
-      settings: { foreground: "syntaxFunction" },
-    },
-    {
-      scope: ["constant.numeric"],
-      settings: { foreground: "syntaxNumber" },
-    },
-    {
-      scope: [
-        "entity.name.type",
-        "support.class",
-        "storage.type.powershell",
-        "storage.type.cs",
-      ],
-      settings: { foreground: "syntaxType" },
-    },
-    {
-      scope: [
-        "punctuation.section",
-        "punctuation.separator",
-        "punctuation.terminator",
-      ],
-      settings: { foreground: "syntaxPunctuation" },
-    },
-  ],
-};
-
-let cachedHighlighter: HighlighterGeneric<any, any> | null = null;
-let highlighterPromise: Promise<HighlighterGeneric<any, any>> | null = null;
-
-export async function getHighlighterInstance(): Promise<
-  HighlighterGeneric<any, any>
-> {
-  if (cachedHighlighter) return cachedHighlighter;
-  if (!highlighterPromise) {
-    highlighterPromise = createHighlighter({
-      themes: [OMP_SYNTAX_THEME],
-      langs: ["powershell"],
-    }).then((h) => {
-      cachedHighlighter = h;
-      return h;
-    });
-  }
-  return highlighterPromise;
-}
-
-// Eager background preloading
-getHighlighterInstance().catch(() => {});
-
-/** Highlight a PowerShell command line, returning one ANSI-colored string per line. */
-export function highlightPowerShell(code: string, theme: Theme): string[] {
-  if (!cachedHighlighter) {
-    return code.split("\n");
-  }
-  try {
-    const result = cachedHighlighter.codeToTokens(code, {
-      lang: "powershell",
-      theme: "omp-syntax",
-    });
-    return result.tokens.map((line) =>
-      line
-        .map((token) => {
-          const color = token.color;
-          if (color && color !== "default" && typeof theme.fg === "function") {
-            return theme.fg(color, token.content);
-          }
-          return token.content;
-        })
-        .join(""),
-    );
-  } catch {
-    return code.split("\n");
-  }
-}
-// ---------------------------------------------------------------------------
-// Eval-style frame builders: titled top bar, tee divider with label, rows,
-// bottom bar. Mirrors the built-in eval/bash rendering (`╭─── Title ───╮`,
-// `├─── Output ───┤`) within the extension's duck-typed component limits.
-// ---------------------------------------------------------------------------
-
-/**
- * Inner frame width. One column shorter than the maximum so the closing tee /
- * corner survives width math: box-drawing glyphs (U+2500-U+257F) are
- * Ambiguous-width, and some width engines count them as 2 columns.
- */
-function frameInnerWidth(width: number): number {
-  return Math.max(10, width - 3);
-}
-
-/**
- * `╭─── {title} ────────────────────╮`
- * Border glyphs are colored independently so ANSI inside `title` (icon/status
- * colors) cannot reset the frame color mid-line.
- */
-function frameTop(width: number, theme: Theme, title: string): string {
-  const br = theme.boxRound;
-  const h = br?.horizontal ?? "-";
-  const inner = frameInnerWidth(width);
-  const titleLen = visibleLength(title);
-  const fill = Math.max(0, inner - 5 - titleLen);
-  const cornerL = theme.fg("border", br?.topLeft ?? "+");
-  const cornerR = theme.fg("border", br?.topRight ?? "+");
-  const prefix = theme.fg("border", `${h}${h}${h} `);
-  const hline = theme.fg("border", h.repeat(fill));
-  return `${cornerL}${prefix}${title} ${hline}${cornerR}`;
-}
-
-/**
- * `├─── {label} ────────────────────┤`
- * NOTE: omp's symbol table names tees from the glyph's own direction
- * (teeLeft = `┤`, teeRight = `├`), so left border uses `teeRight` and vice
- * versa. Tees and filler share one ANSI segment per side so terminal width
- * handling can never drop the closing tee.
- */
-function frameDivider(width: number, theme: Theme, label: string): string {
-  const bs = theme.boxSharp;
-  const h = theme.boxRound?.horizontal ?? bs?.horizontal ?? "-";
-  const teeL = bs?.teeRight ?? "├";
-  const teeR = bs?.teeLeft ?? "┤";
-  const inner = frameInnerWidth(width);
-  const labelLen = visibleLength(label);
-  const fill = Math.max(0, inner - 5 - labelLen);
-  const left = theme.fg("border", `${teeL}${h}${h}${h} `);
-  const right = theme.fg("border", `${h.repeat(fill)}${teeR}`);
-  return `${left}${label} ${right}`;
-}
-
-/** `│ content (padded) │` - one content row inside the frame. */
-function frameRow(content: string, width: number, theme: Theme): string {
-  const br = theme.boxRound;
-  const v = theme.fg("border", br?.vertical ?? "|");
-  const inner = frameInnerWidth(width);
-  const sliced = ansiSafeSlice(content, inner - 2);
-  const pad = Math.max(0, inner - 2 - visibleLength(sliced));
-  return `${v} ${sliced}${" ".repeat(pad)} ${v}`;
-}
-
-/** `╰────────────────────────╯` */
-function frameBottom(width: number, theme: Theme): string {
-  const br = theme.boxRound;
-  const h = br?.horizontal ?? "-";
-  const inner = frameInnerWidth(width);
-  return theme.fg(
-    "border",
-    `${br?.bottomLeft ?? "+"}${h.repeat(inner)}${br?.bottomRight ?? "+"}`,
-  );
-}
-
-const LANG_ICON = "\u{E86C}";
-
-/** Titled bar text: accent icon + bright toolTitle text. */
-function frameTitle(theme: Theme, cwd?: string, extra?: string): string {
-  const body = ` PowerShell${cwd ? ` · ${cwd}` : ""}${extra ?? ""}`;
-  return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
-}
-
-const PREVIEW_LINES_COLLAPSED = 6;
-const PREVIEW_LINES_EXPANDED = 20;
-
-interface PwshRenderResult {
-  details?: PwshDetails;
-  isError?: boolean;
-}
-
-interface PwshRenderOptions {
-  expanded?: boolean;
-  isPartial?: boolean;
-  spinnerFrame?: number;
-}
-
-/** Status icon + label for the divider line (exit-code aware). */
-function renderStatusLabel(
-  d: PwshDetails,
-  isError: boolean,
-  theme: Theme,
-  isPartial = false,
-): string {
-  if (isPartial || d.streaming) {
-    return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
-  }
-  const hasExitCode = d.exitCode != null && d.exitCode !== 0;
-  const bad = isError || hasExitCode;
-  const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";
-  const state = d.dead
-    ? "process died"
-    : d.timedOut
-      ? "timed out"
-      : bad
-        ? "error"
-        : "completed";
-  const color = d.dead
-    ? "error"
-    : d.timedOut
-      ? "warning"
-      : bad
-        ? "error"
-        : "success";
-  const exitText = hasExitCode ? ` · exit ${d.exitCode}` : "";
-  return `${theme.fg(color, icon)} ${state}${exitText} · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
-}
-
-/** Command source lines shown before collapsing behind a ctrl+o hint. */
-const COMMAND_PREVIEW_LINES = 4;
-
-/**
- * Command block rows: wrapped highlighted command lines. Collapsed shows the
- * first `COMMAND_PREVIEW_LINES` source lines plus a hint for the rest;
- * expanded shows every line - multi-line scripts (here-strings, script
- * blocks) used to stop dead after line four with no indication.
- * Shared by renderCall and renderResult (pending + merged frames).
- * `closed: false` leaves the frame open (no bottom bar) so a merged
- * renderResult can follow with the status divider + output + single bottom.
- */
-function commandBlock(
-  theme: Theme,
-  width: number,
-  command: string,
-  cwd: string | undefined,
-  running: boolean,
-  closed = true,
-  expanded = false,
-): string[] {
-  const effectiveCwd = cwd || process.cwd();
-  const title = frameTitle(theme, effectiveCwd, running ? " · executing…" : "");
-  const out: string[] = [frameTop(width, theme, title)];
-  let lines: string[];
-  try {
-    lines = highlightPowerShell(command, theme);
-  } catch {
-    lines = command.split("\n");
-  }
-  // A trailing newline in the submitted command is not a command line.
-  while (lines.length > 1 && lines[lines.length - 1]!.trim() === "") lines.pop();
-  const visibleCount = expanded
-    ? lines.length
-    : Math.min(lines.length, COMMAND_PREVIEW_LINES);
-  const maxCommandWidth = Math.max(1, frameInnerWidth(width) - 2);
-  for (const line of lines.slice(0, visibleCount)) {
-    for (const wrapped of wrapAnsiLine(line, maxCommandWidth))
-      out.push(frameRow(wrapped, width, theme));
-  }
-  const hiddenLines = lines.length - visibleCount;
-  if (hiddenLines > 0) {
-    out.push(
-      frameRow(
-        theme.fg("dim", `… ${hiddenLines} more lines (ctrl+o to expand)`),
-        width,
-        theme,
-      ),
-    );
-  }
-  if (closed) out.push(frameBottom(width, theme));
-  return out;
-}
-
-function renderBody(
-  d: PwshDetails,
-  expanded: boolean,
-  theme: Theme,
-  width: number,
-): string[] {
-  // Normalize CRLF: pwsh emits \r\n frames that would make the terminal
-  // cursor jump back to line start (blank-looking rows).
-  const body = (d.error ?? d.output ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-  if (!body) return [];
-  const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
-  // Out-String pads leading/trailing blank lines (CRLF frames); trim both
-  // ends and collapse interior blank runs so the preview is compact.
-  const raw = body.split("\n");
-  let start = 0;
-  while (start < raw.length && raw[start]!.trim() === "") start++;
-  let end = raw.length;
-  while (end > start && raw[end - 1]!.trim() === "") end--;
-  const trimmed = raw.slice(start, end);
-  const bodyLines: string[] = [];
-  let prevBlank = false;
-  const maxBodyWidth = Math.max(1, frameInnerWidth(width) - 2);
-  for (const line of trimmed) {
-    const blank = line.trim() === "";
-    if (blank && prevBlank) continue;
-    prevBlank = blank;
-    bodyLines.push(...wrapAnsiLine(line, maxBodyWidth));
-  }
-  const lines = bodyLines.slice(0, maxLines);
-  if (bodyLines.length > maxLines) {
-    lines.push(
-      theme.fg(
-        "dim",
-        `… ${bodyLines.length - maxLines} more lines (ctrl+o to expand)`,
-      ),
-    );
-  }
-  return lines;
-}
 
 export function definePwshTool(pi: ExtensionAPI) {
   const z = pi.zod;
 
   return {
     name: "pwsh",
-    label: "PowerShell 7",
+    label: TOOL_LABEL,
     description:
       "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats.",
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
@@ -750,6 +293,12 @@ export function definePwshTool(pi: ExtensionAPI) {
     // ToolExecutionComponent via the wrapper proxy (tool-execution.ts:1012).
     mergeCallAndResult: true as boolean,
     parameters: z.object({
+      i: z
+        .string()
+        .optional()
+        .describe(
+          "Intent for this call, capitalized 2-6 words as a present participle (e.g. 'List large files'); shown as the card title",
+        ),
       command: z
         .string()
         .describe(
@@ -805,17 +354,25 @@ export function definePwshTool(pi: ExtensionAPI) {
       }
     },
     renderCall(args: PwshParams, options: PwshRenderOptions, theme: Theme) {
+      // While the model is still emitting the arguments, show the inline pending
+      // row (grep/glob style: one line, no card) instead of a frame — a
+      // half-streamed command must not draw a card, and neither the intent nor the
+      // cwd have finished arriving. Marked as framed so the host adds neither
+      // padding nor its state tint; the leading column is ours, like the
+      // `Text(text, 1, 0)` those built-ins return.
+      if (options.argsComplete !== true) {
+        return markFramedBlockComponent({
+          render: () => [renderPendingRow(theme, callTitle(options, args))],
+        });
+      }
       return markFramedBlockComponent({
         render: (width: number) =>
-          commandBlock(
-            theme,
-            width,
-            args.command ?? "",
-            args.cwd ?? process.cwd(),
-            options.spinnerFrame !== undefined,
-            true,
-            options.expanded === true,
-          ),
+          commandBlock(theme, width, args.command ?? "", {
+            label: callTitle(options, args),
+            cwd: args.cwd,
+            closed: true,
+            expanded: options.expanded === true,
+          }),
       });
     },
     renderResult(
@@ -826,63 +383,32 @@ export function definePwshTool(pi: ExtensionAPI) {
     ) {
       const d = result.details;
       if (!d) {
-        // Partial/pending result (onUpdate fired, no details yet): keep the
-        // command block visible instead of an empty frame.
+        // Partial/pending result (onUpdate fired, no details yet): args are
+        // complete by now, so keep the command block visible.
         return markFramedBlockComponent({
           render: (width: number) =>
-            commandBlock(
-              theme,
-              width,
-              args?.command ?? "",
-              args?.cwd ?? process.cwd(),
-              options.spinnerFrame !== undefined,
-              true,
-              options.expanded === true,
-            ),
+            commandBlock(theme, width, args?.command ?? "", {
+              label: callTitle(options, args),
+              cwd: args?.cwd,
+              closed: true,
+              expanded: options.expanded === true,
+            }),
         });
       }
-      const expanded = options.expanded === true;
       const displayDetails = {
         ...d,
         timeoutSec: d.timeoutSec ?? normalizeTimeout(args?.timeout),
       };
-      const statusLabel = renderStatusLabel(
-        displayDetails,
-        result.isError === true,
-        theme,
-        options.isPartial === true,
-      );
       return markFramedBlockComponent({
-        render: (width: number) => {
-          const bodyLines = renderBody(d, expanded, theme, width);
-          // Command block (merged frame, like built-in tools) - left open
-          // so the status divider + output rows share one frame with a
-          // single bottom bar.
-          const out = commandBlock(
-            theme,
-            width,
-            args?.command ?? "",
-            d.cwd || args?.cwd || process.cwd(),
-            false,
-            false,
-            expanded,
-          );
-          // Status + timing divider
-          out.push(frameDivider(width, theme, statusLabel));
-          // Output rows
-          for (const l of bodyLines) out.push(frameRow(l, width, theme));
-          if (expanded && d.dead) {
-            out.push(
-              frameRow(
-                theme.fg("dim", "session reset; will be rebuilt on next call"),
-                width,
-                theme,
-              ),
-            );
-          }
-          out.push(frameBottom(width, theme));
-          return out;
-        },
+        render: (width: number) =>
+          renderCard(theme, width, args?.command ?? "", displayDetails, {
+            label: callTitle(options, args),
+            // Only an explicit `cwd` reaches the title; the session cwd is implied.
+            cwd: args?.cwd,
+            expanded: options.expanded === true,
+            isPartial: options.isPartial === true,
+            isError: result.isError === true,
+          }),
       });
     },
   };
@@ -890,6 +416,7 @@ export function definePwshTool(pi: ExtensionAPI) {
 
 // Module-level pool so the tool keeps sessions across calls within the process.
 let pool: PwshSessionPool | null = null;
+
 function getPool(): PwshSessionPool {
   if (!pool) pool = new PwshSessionPool();
   return pool;
