@@ -589,7 +589,7 @@ const LANG_ICON = "\u{E86C}";
 
 /** Titled bar text: accent icon + bright toolTitle text. */
 function frameTitle(theme: Theme, cwd?: string, extra?: string): string {
-  const body = ` • PowerShell${cwd ? ` · ${cwd}` : ""}${extra ?? ""}`;
+  const body = ` PowerShell${cwd ? ` · ${cwd}` : ""}${extra ?? ""}`;
   return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
 }
 
