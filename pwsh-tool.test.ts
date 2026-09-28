@@ -19,6 +19,7 @@ const zStub = {
   enum: schema,
   object: schema,
   record: schema,
+  boolean: schema,
 };
 
 const theme = {
@@ -122,6 +123,7 @@ test("uses normal optional property names in the public tool schema", () => {
     string: node,
     number: node,
     enum: node,
+    boolean: node,
     object(shape: Record<string, unknown>) {
       objectShapes.push(shape);
       return node();
@@ -133,6 +135,9 @@ test("uses normal optional property names in the public tool schema", () => {
   expect(Object.keys(objectShapes.at(-1)!)).toEqual([
     "i",
     "command",
+    "async",
+    "jobId",
+    "action",
     "cwd",
     "env",
     "format",
@@ -157,6 +162,7 @@ test("defines env as a dynamic string record", () => {
     string: () => stringSchema,
     number: node,
     enum: node,
+    boolean: node,
     object(shape: Record<string, unknown>) {
       objectShapes.push(shape);
       return node();
@@ -667,7 +673,7 @@ const schema = () => ({
 	describe() { return this; },
 	optional() { return this; },
 });
-const zod = { string: schema, number: schema, enum: schema, object: schema, record: schema };
+const zod = { string: schema, number: schema, enum: schema, object: schema, record: schema, boolean: schema };
 const theme = { fg: (color, text) => \`[\${color}]\${text}[/\${color}]\` };
 let rendered = "";
 

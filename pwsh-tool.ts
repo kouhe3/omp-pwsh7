@@ -23,6 +23,7 @@ import {
   type Theme,
 } from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
+import { PwshJobManager, type PwshJobStatus } from "./job";
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -33,7 +34,7 @@ const MAX_WIDTH = 4096;
 const STREAM_PREVIEW_CHARS = 50 * 1024;
 
 export interface PwshParams {
-  command: string;
+  command?: string;
   /**
    * Model-declared intent (`INTENT_FIELD`), the harness-wide `i` argument: a
    * capitalized 2-6 word present participle. It becomes the card title, so the
@@ -46,6 +47,9 @@ export interface PwshParams {
   width?: number;
   timeout?: number;
   session?: string;
+  async?: boolean;
+  jobId?: string;
+  action?: "status" | "kill";
 }
 
 export interface PwshDetails {
@@ -60,6 +64,10 @@ export interface PwshDetails {
   error?: string | null;
   output?: string | null;
   wallTimeMs: number;
+  async?: boolean;
+  jobId?: string;
+  status?: PwshJobStatus;
+  command?: string;
 }
 
 interface SessionLike {
@@ -99,9 +107,17 @@ export async function runPwsh(
   onUpdate?: (update: PwshUpdate) => void,
   signal?: AbortSignal,
 ): Promise<{ text: string; details: PwshDetails; isError?: boolean }> {
+  const cwd = params.cwd ?? process.cwd();
+  if (!params.command) {
+    const error = "Missing command to execute.";
+    return {
+      text: error,
+      details: emptyDetails(params, cwd, error),
+      isError: true,
+    };
+  }
   const started = Date.now();
   const command = params.command;
-  const cwd = params.cwd ?? process.cwd();
   onUpdate?.({
     content: [
       {
@@ -207,8 +223,14 @@ export async function runPwsh(
     };
   }
   if (runResult.aborted) {
+    details.output = runResult.partialOutput;
+    const isMessageInterruption =
+      signal?.reason === Symbol.for("pi-agent-core.tool-interrupt");
+    const msg = isMessageInterruption
+      ? "Command interrupted by message."
+      : "Command cancelled.";
     return {
-      text: "Command cancelled",
+      text: `${msg}${runResult.partialOutput ? `\nPartial output:\n${runResult.partialOutput}` : ""}`,
       details,
     };
   }
@@ -278,8 +300,9 @@ function normalizeWidth(value: number | undefined): number {
 // ---------------------------------------------------------------------------
 
 export function definePwshTool(pi: ExtensionAPI) {
+  // Ensure the background job manager is initialized and bound to the host ExtensionAPI.
+  getJobManager(pi);
   const z = pi.zod;
-
   return {
     name: "pwsh",
     label: TOOL_LABEL,
@@ -301,9 +324,24 @@ export function definePwshTool(pi: ExtensionAPI) {
         ),
       command: z
         .string()
+        .optional()
         .describe(
-          "PowerShell script to execute (multi-line / script blocks supported)",
+          "PowerShell script to execute (multi-line / script blocks supported); required when starting a command",
         ),
+      async: z
+        .boolean()
+        .optional()
+        .describe(
+          "run command asynchronously in the background; returns immediately with jobId and delivers results automatically",
+        ),
+      jobId: z
+        .string()
+        .optional()
+        .describe("job ID of an async background job to inspect or stop"),
+      action: z
+        .enum(["status", "kill"])
+        .optional()
+        .describe("action for background job: 'status' to inspect, 'kill' to stop"),
       cwd: z
         .string()
         .optional()
@@ -340,8 +378,150 @@ export function definePwshTool(pi: ExtensionAPI) {
       onUpdate:
         | ((update: { content: Array<{ type: "text"; text: string }> }) => void)
         | undefined,
-    ) {
+    ): Promise<{
+      content: Array<{ type: "text"; text: string }>;
+      details: PwshDetails;
+      isError?: boolean;
+    }> {
       const pool = getPool();
+      const jm = getJobManager(pi);
+      const cwd = params.cwd ?? process.cwd();
+
+      if (params.action && !params.jobId) {
+        const err = `Missing jobId for action '${params.action}'.`;
+        return {
+          content: [{ type: "text" as const, text: err }],
+          details: emptyDetails(params, cwd, err),
+          isError: true,
+        };
+      }
+
+      // Branch 1: Job control via jobId
+      if (params.jobId) {
+        if (params.action === "kill") {
+          const job = jm.getJob(params.jobId);
+          if (!job) {
+            const err = `Job '${params.jobId}' not found.`;
+            return {
+              content: [{ type: "text" as const, text: err }],
+              details: emptyDetails(params, cwd, err),
+              isError: true,
+            };
+          }
+          if (job.status !== "running") {
+            const text = `Job '${job.id}' is not running (status: ${job.status}).`;
+            return {
+              content: [{ type: "text" as const, text }],
+              details: {
+                ...emptyDetails(params, cwd, ""),
+                async: true,
+                jobId: job.id,
+                status: job.status,
+                command: job.command,
+                output: job.output,
+                exitCode: job.exitCode,
+                timeoutSec: job.timeoutSec,
+                wallTimeMs: (job.endTime ?? Date.now()) - job.startTime,
+              },
+            };
+          }
+          const killed = jm.killJob(params.jobId)!;
+          const text = `PowerShell background job '${killed.id}' killed.`;
+          return {
+            content: [{ type: "text" as const, text }],
+            details: {
+              ...emptyDetails(params, cwd, ""),
+              async: true,
+              jobId: killed.id,
+              status: "killed",
+              command: killed.command,
+              output: killed.output,
+              timeoutSec: killed.timeoutSec,
+              wallTimeMs: (killed.endTime ?? Date.now()) - killed.startTime,
+            },
+          };
+        }
+
+        // Default or action: "status"
+        const job = jm.getJob(params.jobId);
+        if (!job) {
+          const err = `Job '${params.jobId}' not found.`;
+          return {
+            content: [{ type: "text" as const, text: err }],
+            details: emptyDetails(params, cwd, err),
+            isError: true,
+          };
+        }
+
+        const durationMs = (job.endTime ?? Date.now()) - job.startTime;
+        const durationSec = (durationMs / 1000).toFixed(1);
+        const text = [
+          `Job '${job.id}' (${job.status}, ${durationSec}s)`,
+          job.exitCode != null ? `Exit code: ${job.exitCode}` : undefined,
+          job.output.trim() ? `Output:\n${job.output.trim()}` : undefined,
+          job.error ? `Error: ${job.error}` : undefined,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        return {
+          content: [{ type: "text" as const, text }],
+          details: {
+            ...emptyDetails(params, cwd, job.error ?? ""),
+            async: true,
+            jobId: job.id,
+            status: job.status,
+            command: job.command,
+            output: job.output,
+            exitCode: job.exitCode,
+            timeoutSec: job.timeoutSec,
+            wallTimeMs: durationMs,
+          },
+          isError: job.status === "failed",
+        };
+      }
+
+      // Branch 2: Async execution
+      if (params.async === true) {
+        if (!params.command) {
+          const err = "Missing command to execute in async mode.";
+          return {
+            content: [{ type: "text" as const, text: err }],
+            details: emptyDetails(params, cwd, err),
+            isError: true,
+          };
+        }
+        const job = jm.startJob({
+          command: params.command,
+          cwd,
+          intent: params.i,
+          env: params.env,
+          format: params.format,
+          width: params.width,
+          timeoutSec: normalizeTimeout(params.timeout),
+        });
+
+        const text = [
+          `Background job '${job.id}' started.`,
+          `Command: ${job.command}`,
+          `The result will be delivered automatically upon completion. Inspect with { jobId: "${job.id}" } or stop with { jobId: "${job.id}", action: "kill" }.`,
+        ].join("\n");
+
+        return {
+          content: [{ type: "text" as const, text }],
+          details: {
+            ...emptyDetails(params, cwd, ""),
+            async: true,
+            jobId: job.id,
+            status: "running",
+            command: job.command,
+            output: "",
+            timeoutSec: job.timeoutSec,
+          },
+        };
+      }
+
+      // Branch 3: Synchronous foreground execution
       const out = await runPwsh(params, pool, onUpdate, signal);
       const content = [{ type: "text" as const, text: out.text }];
       return { content, details: out.details, isError: out.isError };
@@ -350,6 +530,7 @@ export function definePwshTool(pi: ExtensionAPI) {
       // Session lifecycle cleanup: kill pwsh subprocesses on shutdown so no
       // orphan processes survive the omp session.
       if (event.reason === "shutdown") {
+        getJobManager().disposeAll();
         getPool().disposeAll();
       }
     },
@@ -400,15 +581,17 @@ export function definePwshTool(pi: ExtensionAPI) {
         timeoutSec: d.timeoutSec ?? normalizeTimeout(args?.timeout),
       };
       return markFramedBlockComponent({
-        render: (width: number) =>
-          renderCard(theme, width, args?.command ?? "", displayDetails, {
+        render: (width: number) => {
+          const effectiveCommand = args?.command || d.command || "";
+          return renderCard(theme, width, effectiveCommand, displayDetails, {
             label: callTitle(options, args),
             // Only an explicit `cwd` reaches the title; the session cwd is implied.
             cwd: args?.cwd,
             expanded: options.expanded === true,
             isPartial: options.isPartial === true,
             isError: result.isError === true,
-          }),
+          });
+        },
       });
     },
   };
@@ -420,4 +603,22 @@ let pool: PwshSessionPool | null = null;
 function getPool(): PwshSessionPool {
   if (!pool) pool = new PwshSessionPool();
   return pool;
+}
+
+let jobManager: PwshJobManager | null = null;
+
+export function getJobManager(pi?: ExtensionAPI): PwshJobManager {
+  if (!jobManager) {
+    jobManager = new PwshJobManager(getPool(), pi);
+  } else if (pi) {
+    jobManager.setExtensionApi(pi);
+  }
+  return jobManager;
+}
+
+export function resetJobManager(): void {
+  if (jobManager) {
+    jobManager.disposeAll();
+    jobManager = null;
+  }
 }

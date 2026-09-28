@@ -215,6 +215,25 @@ function frameBottom(width: number, theme: Theme): string {
   );
 }
 
+/** `╰─── status ────────────────────────╯` */
+function frameBottomWithStatus(
+  width: number,
+  theme: Theme,
+  label: string,
+): string {
+  const br = theme.boxRound;
+  const bs = theme.boxSharp;
+  const h = br?.horizontal ?? bs?.horizontal ?? "-";
+  const cornerL = br?.bottomLeft ?? "+";
+  const cornerR = br?.bottomRight ?? "+";
+  const inner = frameInnerWidth(width);
+  const shown = ansiSafeSlice(label, Math.max(1, inner - 5));
+  const fill = Math.max(0, inner - 5 - visibleLength(shown));
+  const left = theme.fg("border", `${cornerL}${h}${h}${h} `);
+  const right = theme.fg("border", `${h.repeat(fill)}${cornerR}`);
+  return `${left}${shown} ${right}`;
+}
+
 const LANG_ICON = "\u{E86C}";
 
 /** Tool label: the card's fallback title and the tool's registered `label`. */
@@ -244,10 +263,20 @@ function frameTitle(theme: Theme, label: string, cwd?: string): string {
  * newline, and a newline inside a rendered row splits the frame in the terminal.
  * The host flattens intent text for the same reason (`renderStatusLine`).
  */
-function callLabel(args: { i?: unknown }): string {
+function callLabel(args: {
+  i?: unknown;
+  jobId?: unknown;
+  action?: unknown;
+}): string {
   const intent =
     typeof args.i === "string" ? args.i.replace(/\s+/g, " ").trim() : "";
-  return intent.length > 0 ? intent : TOOL_LABEL;
+  if (intent.length > 0) return intent;
+  if (typeof args.jobId === "string" && args.jobId.trim().length > 0) {
+    const cleanJobId = args.jobId.replace(/\s+/g, " ").trim();
+    const action = args.action === "kill" ? "Kill job" : "Job status";
+    return `${action} ${cleanJobId}`;
+  }
+  return TOOL_LABEL;
 }
 
 /**
@@ -266,7 +295,7 @@ const streamedIntents = new WeakMap<object, string>();
 /** Title for one card: the args' intent while they still carry it, else the memo. */
 export function callTitle(
   options: PwshRenderOptions,
-  args: { i?: unknown } | undefined,
+  args: { i?: unknown; jobId?: unknown; action?: unknown } | undefined,
 ): string {
   const fromArgs = callLabel(args ?? {});
   if (fromArgs === TOOL_LABEL) return streamedIntents.get(options) ?? TOOL_LABEL;
@@ -329,19 +358,30 @@ function renderStatusLabel(
   theme: Theme,
   isPartial = false,
 ): string {
+  if (d.async && d.status === "running") {
+    const jobTag = d.jobId ? ` [${d.jobId.replace(/\s+/g, " ").trim()}]` : "";
+    return `${theme.fg("accent", "●")} running${jobTag}`;
+  }
+  if (d.status === "killed") {
+    const jobTag = d.jobId ? ` [${d.jobId.replace(/\s+/g, " ").trim()}]` : "";
+    return `${theme.fg("error", "◼")} killed${jobTag}`;
+  }
   if (isPartial || d.streaming) {
     return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
   }
   const hasExitCode = d.exitCode != null && d.exitCode !== 0;
-  const bad = isError || hasExitCode;
+  const isFailed = d.status === "failed";
+  const bad = isError || hasExitCode || isFailed;
   const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";
   const state = d.dead
     ? "process died"
     : d.timedOut
       ? "timed out"
-      : bad
-        ? "error"
-        : "completed";
+      : isFailed
+        ? "failed"
+        : bad
+          ? "error"
+          : "completed";
   const color = d.dead
     ? "error"
     : d.timedOut
@@ -394,6 +434,10 @@ export function commandBlock(
     formatToolWorkingDirectory(cwd, process.cwd()),
   );
   const out: string[] = [frameTop(width, theme, title)];
+  if (command.trim().length === 0) {
+    if (closed) out.push(frameBottom(width, theme));
+    return out;
+  }
   let lines: string[];
   try {
     lines = highlightPowerShell(command, theme);
@@ -480,35 +524,64 @@ export function renderCard(
   options: PwshRenderOptions & PwshFrameOptions & { isError?: boolean } = {},
 ): string[] {
   const expanded = options.expanded === true;
+  const statusText = renderStatusLabel(
+    details,
+    options.isError === true,
+    theme,
+    options.isPartial === true,
+  );
+  const bodyLines = renderBody(details, expanded, theme, width);
+  if (expanded && details.dead) {
+    bodyLines.push(
+      theme.fg("dim", "session reset; will be rebuilt on next call"),
+    );
+  }
+
+  const hasCommand = command.trim().length > 0;
+  const hasBody = bodyLines.length > 0;
+
+  // Case 1: No body output (e.g. async job start, silent command, or kill action)
+  // Ergonomic design: merge the status label directly into the closing bottom border!
+  // No empty space, no awkward double-border (divider immediately followed by bottom).
+  if (!hasBody) {
+    const out = commandBlock(theme, width, command, {
+      label: options.label,
+      cwd: options.cwd,
+      closed: false,
+      expanded,
+    });
+    out.push(frameBottomWithStatus(width, theme, statusText));
+    return out;
+  }
+
+  // Case 2: Has body output, but no command (e.g. inspecting job status)
+  // Ergonomic design: Top title border -> output lines -> status bottom border.
+  // No empty command row, no stacked top divider.
+  if (!hasCommand) {
+    const title = frameTitle(
+      theme,
+      options.label ?? TOOL_LABEL,
+      formatToolWorkingDirectory(options.cwd, process.cwd()),
+    );
+    const out: string[] = [frameTop(width, theme, title)];
+    for (const line of bodyLines) {
+      out.push(frameRow(line, width, theme));
+    }
+    out.push(frameBottomWithStatus(width, theme, statusText));
+    return out;
+  }
+
+  // Case 3: Classic full card (has command AND has body output)
+  // Top title border -> command rows -> status divider -> output rows -> bottom border.
   const out = commandBlock(theme, width, command, {
     label: options.label,
     cwd: options.cwd,
     closed: false,
     expanded,
   });
-  out.push(
-    frameDivider(
-      width,
-      theme,
-      renderStatusLabel(
-        details,
-        options.isError === true,
-        theme,
-        options.isPartial === true,
-      ),
-    ),
-  );
-  for (const line of renderBody(details, expanded, theme, width)) {
+  out.push(frameDivider(width, theme, statusText));
+  for (const line of bodyLines) {
     out.push(frameRow(line, width, theme));
-  }
-  if (expanded && details.dead) {
-    out.push(
-      frameRow(
-        theme.fg("dim", "session reset; will be rebuilt on next call"),
-        width,
-        theme,
-      ),
-    );
   }
   out.push(frameBottom(width, theme));
   return out;
