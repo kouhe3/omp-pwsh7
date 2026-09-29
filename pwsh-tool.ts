@@ -100,6 +100,26 @@ type PwshUpdate = {
   details?: Partial<PwshDetails>;
 };
 
+/** Result of one tool call: a single text body plus its details. */
+type PwshToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details: PwshDetails;
+  isError?: boolean;
+};
+
+/**
+ * Build a one-text result. Every branch returns through here so the error,
+ * job-snapshot, and foreground shapes cannot drift apart.
+ */
+function toolText(
+  text: string,
+  details: PwshDetails,
+  isError?: boolean,
+): PwshToolResult {
+  const content = [{ type: "text" as const, text }];
+  return isError ? { content, details, isError: true } : { content, details };
+}
+
 /** Core execute body - split out for smoke tests. */
 export async function runPwsh(
   params: PwshParams,
@@ -413,22 +433,14 @@ export function definePwshTool(pi: ExtensionAPI) {
       onUpdate:
         | ((update: { content: Array<{ type: "text"; text: string }> }) => void)
         | undefined,
-    ): Promise<{
-      content: Array<{ type: "text"; text: string }>;
-      details: PwshDetails;
-      isError?: boolean;
-    }> {
+    ): Promise<PwshToolResult> {
       const pool = getPool();
       const jm = getJobManager(pi);
       const cwd = params.cwd ?? process.cwd();
 
       if (params.action && !params.jobId) {
         const err = `Missing jobId for action '${params.action}'.`;
-        return {
-          content: [{ type: "text" as const, text: err }],
-          details: emptyDetails(params, cwd, err),
-          isError: true,
-        };
+        return toolText(err, emptyDetails(params, cwd, err), true);
       }
 
       // Branch 1: Job control via jobId
@@ -438,22 +450,17 @@ export function definePwshTool(pi: ExtensionAPI) {
         // lookup taken after the settle would report not-found for a job the
         // waiter already observed. A missing job falls through to the shared
         // not-found below.
-        let job = jm.getJob(params.jobId);
+        const job = jm.getJob(params.jobId);
 
         if (params.action === "kill" && job) {
           if (job.status !== "running") {
             const text = `Job '${job.id}' is not running (status: ${job.status}).`;
-            return {
-              content: [{ type: "text" as const, text }],
-              details: jobDetails(job, params, cwd, ""),
-            };
+            return toolText(text, jobDetails(job, params, cwd, ""));
           }
-          const killed = jm.killJob(params.jobId)!;
-          const text = `PowerShell background job '${killed.id}' killed.`;
-          return {
-            content: [{ type: "text" as const, text }],
-            details: jobDetails(killed, params, cwd, ""),
-          };
+          // killJob mutates the handle in place, so `job` carries the killed state.
+          jm.killJob(job.id);
+          const text = `PowerShell background job '${job.id}' killed.`;
+          return toolText(text, jobDetails(job, params, cwd, ""));
         }
 
         // action: "wait" - block until settlement, the wait budget, or abort.
@@ -485,41 +492,28 @@ export function definePwshTool(pi: ExtensionAPI) {
             ]
               .filter(Boolean)
               .join("\n");
-            return {
-              content: [{ type: "text" as const, text }],
-              details: jobDetails(pendingJob, params, cwd, ""),
-            };
+            return toolText(text, jobDetails(pendingJob, params, cwd, ""));
           }
         }
 
         // Default, action: "status", or a wait that already settled
         if (!job) {
           const err = `Job '${params.jobId}' not found.`;
-          return {
-            content: [{ type: "text" as const, text: err }],
-            details: emptyDetails(params, cwd, err),
-            isError: true,
-          };
+          return toolText(err, emptyDetails(params, cwd, err), true);
         }
 
-        const text = jobSnapshotText(job);
-
-        return {
-          content: [{ type: "text" as const, text }],
-          details: jobDetails(job, params, cwd),
-          isError: job.status === "failed",
-        };
+        return toolText(
+          jobSnapshotText(job),
+          jobDetails(job, params, cwd),
+          job.status === "failed",
+        );
       }
 
       // Branch 2: Async execution
       if (params.async === true) {
         if (!params.command) {
           const err = "Missing command to execute in async mode.";
-          return {
-            content: [{ type: "text" as const, text: err }],
-            details: emptyDetails(params, cwd, err),
-            isError: true,
-          };
+          return toolText(err, emptyDetails(params, cwd, err), true);
         }
         const job = jm.startJob({
           command: params.command,
@@ -537,24 +531,20 @@ export function definePwshTool(pi: ExtensionAPI) {
           `The result will be delivered automatically upon completion. Wait with { jobId: "${job.id}", action: "wait" }, inspect with { jobId: "${job.id}" }, or stop with { jobId: "${job.id}", action: "kill" }.`,
         ].join("\n");
 
-        return {
-          content: [{ type: "text" as const, text }],
-          details: {
-            ...emptyDetails(params, cwd, ""),
-            async: true,
-            jobId: job.id,
-            status: "running",
-            command: job.command,
-            output: "",
-            timeoutSec: job.timeoutSec,
-          },
-        };
+        return toolText(text, {
+          ...emptyDetails(params, cwd, ""),
+          async: true,
+          jobId: job.id,
+          status: "running",
+          command: job.command,
+          output: "",
+          timeoutSec: job.timeoutSec,
+        });
       }
 
       // Branch 3: Synchronous foreground execution
       const out = await runPwsh(params, pool, onUpdate, signal);
-      const content = [{ type: "text" as const, text: out.text }];
-      return { content, details: out.details, isError: out.isError };
+      return toolText(out.text, out.details, out.isError);
     },
     onSession(event: { reason: string }): void {
       // Session lifecycle cleanup: kill pwsh subprocesses on shutdown so no

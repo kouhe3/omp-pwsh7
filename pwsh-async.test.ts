@@ -39,6 +39,54 @@ const theme = {
   boxSharp: { teeLeft: "┤", teeRight: "├", horizontal: "─" },
 };
 
+type SentMessage = { message: unknown; options: unknown };
+
+/**
+ * The tool bound to a host stub that records every `sendMessage` aside. Tests
+ * assert both directions: the completion notice that fires on its own, and the
+ * suppression a blocked `wait` imposes. `startJob` runs a real background job
+ * and returns its id plus the start result.
+ */
+function makeTool() {
+  const sentMessages: SentMessage[] = [];
+  const pi = {
+    zod: zStub,
+    sendMessage(message: unknown, options: unknown) {
+      sentMessages.push({ message, options });
+    },
+  } as unknown as ExtensionAPI;
+  const tool = definePwshTool(pi);
+  const startJob = async (
+    callId: string,
+    params: { command: string; i?: string; timeout?: number },
+  ) => {
+    const res = await tool.execute(
+      callId,
+      { ...params, async: true },
+      undefined,
+      undefined,
+    );
+    const jobId = res.details.jobId ?? "";
+    expect(jobId).not.toBe("");
+    return { jobId, res };
+  };
+  return { tool, sentMessages, startJob };
+}
+
+/** Text body of a recorded aside, or "" when it is not a text message. */
+function messageText(sent: SentMessage | undefined): string {
+  const message = sent?.message;
+  if (
+    message &&
+    typeof message === "object" &&
+    "content" in message &&
+    typeof message.content === "string"
+  ) {
+    return message.content;
+  }
+  return "";
+}
+
 test("schema accepts async, jobId, and action parameters", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const shape = (tool.parameters as unknown as { shape: Record<string, unknown> }).shape;
@@ -50,37 +98,19 @@ test("schema accepts async, jobId, and action parameters", () => {
 });
 
 test("starts an async job immediately without blocking and delivers result via sendMessage", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
+  const { sentMessages, startJob } = makeTool();
 
   // Execute with async: true
-  const res = await tool.execute(
-    "call_async_1",
-    {
-      command: "Write-Output 'async finished'",
-      async: true,
-      i: "Testing async execution",
-    },
-    undefined,
-    undefined,
-  );
+  const { jobId, res } = await startJob("call_async_1", {
+    command: "Write-Output 'async finished'",
+    i: "Testing async execution",
+  });
 
   // Tool execution returns immediately with running state
   expect(res.content[0]?.text).toContain("Background job");
   const details = res.details;
-  expect(details).toBeDefined();
   expect(details.async).toBe(true);
   expect(details.status).toBe("running");
-
-  const jobId = details.jobId ?? "";
-  expect(jobId).not.toBe("");
 
   // Await deterministic job settlement promise without using real wall-clock sleeps
   const job = getJobManager().getJob(jobId);
@@ -109,26 +139,12 @@ test("starts an async job immediately without blocking and delivers result via s
 });
 
 test("can inspect status and kill a running async job", async () => {
-  const fakePi = {
-    zod: zStub,
-    sendMessage() {},
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
+  const { tool, startJob } = makeTool();
 
   // Start a long-running job
-  const startRes = await tool.execute(
-    "call_async_long",
-    {
-      command: "Start-Sleep -Seconds 10; Write-Output 'done'",
-      async: true,
-    },
-    undefined,
-    undefined,
-  );
-
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { jobId, res } = await startJob("call_async_long", {
+    command: "Start-Sleep -Seconds 10; Write-Output 'done'",
+  });
 
   // Inspect status
   const statusRes = await tool.execute(
@@ -161,7 +177,7 @@ test("can inspect status and kill a running async job", async () => {
   // Verify ergonomic card rendering for running async job (Case 1: No body, direct status bottom)
   const runningRows = tool
     .renderResult(
-      { details: startRes.details },
+      { details: res.details },
       { expanded: false },
       theme,
       { command: "Start-Sleep -Seconds 10; Write-Output 'done'", async: true, jobId },
@@ -243,21 +259,12 @@ test("disposes worker session in pool upon job completion to prevent subprocess 
 });
 
 test("reports accurate status and wall time when inspecting a finished job", async () => {
-  const fakePi = {
-    zod: zStub,
-    sendMessage() {},
-  } as unknown as ExtensionAPI;
-  const tool = definePwshTool(fakePi);
+  const { tool, startJob } = makeTool();
 
-  const startRes = await tool.execute(
-    "call_async_short",
-    { command: "Write-Output 'quick'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId!;
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  const { jobId } = await startJob("call_async_short", {
+    command: "Write-Output 'quick'",
+  });
+  await getJobManager().getJob(jobId)?.settled;
 
   // Inspect status of completed job
   const statusRes = await tool.execute(
@@ -319,90 +326,38 @@ test("injects pi into existing jobManager singleton and sends completion", async
   const earlyJm = getJobManager();
   expect(earlyJm).toBeDefined();
 
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
   // Now define tool with valid pi
-  const tool = definePwshTool(fakePi);
-  const res = await tool.execute(
-    "call_early_singleton",
-    {
-      command: "Write-Output 'singleton notified'",
-      async: true,
-    },
-    undefined,
-    undefined,
-  );
-
-  const jobId = res.details?.jobId ?? "";
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  const { sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_early_singleton", {
+    command: "Write-Output 'singleton notified'",
+  });
+  await getJobManager().getJob(jobId)?.settled;
 
   expect(sentMessages.length).toBeGreaterThan(0);
-  const firstMsg = sentMessages[0]?.message;
-  let content = "";
-  if (firstMsg && typeof firstMsg === "object" && "content" in firstMsg && typeof firstMsg.content === "string") {
-    content = firstMsg.content;
-  }
-  expect(content).toContain("singleton notified");
+  expect(messageText(sentMessages[0])).toContain("singleton notified");
 });
 
 test("truncates large job output in deliverCompletion prompt to prevent context overflow", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
+  const { sentMessages, startJob } = makeTool();
   // Emit 30,000 characters
-  const res = await tool.execute(
-    "call_large_output",
-    {
-      command: "'A' * 30000",
-      async: true,
-    },
-    undefined,
-    undefined,
-  );
-
-  const jobId = res.details?.jobId ?? "";
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  const { jobId } = await startJob("call_large_output", {
+    command: "'A' * 30000",
+  });
+  await getJobManager().getJob(jobId)?.settled;
 
   expect(sentMessages.length).toBe(1);
-  const firstMsg = sentMessages[0]?.message;
-  let content = "";
-  if (firstMsg && typeof firstMsg === "object" && "content" in firstMsg && typeof firstMsg.content === "string") {
-    content = firstMsg.content;
-  }
+  const content = messageText(sentMessages[0]);
   expect(content).toContain("output truncated");
   expect(content.length).toBeLessThan(20000);
 });
 
 test("preserves original timeoutSec when inspecting job status", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
-  const res = await tool.execute(
-    "call_custom_timeout",
-    {
-      command: "Write-Output 'timeout test'",
-      async: true,
-      timeout: 300,
-    },
-    undefined,
-    undefined,
-  );
-
-  const jobId = res.details?.jobId ?? "";
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  const { tool, startJob } = makeTool();
+  const { jobId } = await startJob("call_custom_timeout", {
+    command: "Write-Output 'timeout test'",
+    timeout: 300,
+  });
+  await getJobManager().getJob(jobId)?.settled;
 
   const statusRes = await tool.execute(
     "call_check_timeout",
@@ -446,61 +401,38 @@ test("returns immediately when signal is already aborted without executing comma
 });
 
 test("normalizes default timeout to 120s and allows 0 to disable timeout", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
+  const { startJob } = makeTool();
 
   // Start with default timeout (omitted)
-  const defaultRes = await tool.execute(
-    "call_default_timeout",
-    { command: "Write-Output 'default timeout'", async: true },
-    undefined,
-    undefined,
-  );
-  const defaultJobId = defaultRes.details?.jobId ?? "";
-  const defaultJob = getJobManager().getJob(defaultJobId);
+  const defaultStart = await startJob("call_default_timeout", {
+    command: "Write-Output 'default timeout'",
+  });
+  expect(defaultStart.res.details?.timeoutSec).toBe(120);
+  const defaultJob = getJobManager().getJob(defaultStart.jobId);
   expect(defaultJob?.timeoutSec).toBe(120);
-  expect(defaultRes.details?.timeoutSec).toBe(120);
   await defaultJob?.settled;
 
   // Start with 0 timeout (disabled)
-  const zeroRes = await tool.execute(
-    "call_zero_timeout",
-    { command: "Write-Output 'zero timeout'", async: true, timeout: 0 },
-    undefined,
-    undefined,
-  );
-  const zeroJobId = zeroRes.details?.jobId ?? "";
-  const zeroJob = getJobManager().getJob(zeroJobId);
+  const zeroStart = await startJob("call_zero_timeout", {
+    command: "Write-Output 'zero timeout'",
+    timeout: 0,
+  });
+  expect(zeroStart.res.details?.timeoutSec).toBe(0);
+  const zeroJob = getJobManager().getJob(zeroStart.jobId);
   expect(zeroJob?.timeoutSec).toBe(0);
-  expect(zeroRes.details?.timeoutSec).toBe(0);
   await zeroJob?.settled;
 });
 
 test("sanitizes async completion notification label and preserves command in startJob details", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
+  const { sentMessages, startJob } = makeTool();
   const multiLineCmd = "Get-Process |\n  Select-Object -First 1";
-  const res = await tool.execute(
-    "call_multiline_delivery",
-    {
-      command: multiLineCmd,
-      async: true,
-      i: "   ", // whitespace only should fallback to command
-    },
-    undefined,
-    undefined,
-  );
+  const { jobId, res } = await startJob("call_multiline_delivery", {
+    command: multiLineCmd,
+    i: "   ", // whitespace only should fallback to command
+  });
 
   expect(res.details.command).toBe(multiLineCmd);
-  const jobId = res.details?.jobId ?? "";
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  await getJobManager().getJob(jobId)?.settled;
 
   expect(sentMessages.length).toBe(1);
   const msg = sentMessages[0]?.message;
@@ -514,23 +446,10 @@ test("sanitizes async completion notification label and preserves command in sta
 });
 
 test("action 'wait' blocks until the job settles and claims the result without a duplicate aside", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_start",
-    { command: "Start-Sleep -Milliseconds 500; Write-Output 'wait-finished'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_start", {
+    command: "Start-Sleep -Milliseconds 500; Write-Output 'wait-finished'",
+  });
 
   const waitRes = await tool.execute("call_wait", { jobId, action: "wait" }, undefined, undefined);
 
@@ -543,23 +462,10 @@ test("action 'wait' blocks until the job settles and claims the result without a
 });
 
 test("a wait timeout detaches the waiter so a later completion still delivers", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_timeout_start",
-    { command: "Start-Sleep -Milliseconds 1500; Write-Output 'late-finished'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_timeout_start", {
+    command: "Start-Sleep -Milliseconds 1500; Write-Output 'late-finished'",
+  });
 
   const waitRes = await tool.execute(
     "call_wait_timeout",
@@ -572,18 +478,12 @@ test("a wait timeout detaches the waiter so a later completion still delivers", 
   expect(sentMessages.length).toBe(0);
 
   // The detached waiter must not swallow the completion notice.
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  await getJobManager().getJob(jobId)?.settled;
   expect(sentMessages.length).toBe(1);
 });
 
 test("action 'wait' on an unknown job reports not found", async () => {
-  const fakePi = {
-    zod: zStub,
-    sendMessage() {},
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
+  const { tool } = makeTool();
   const res = await tool.execute(
     "call_wait_missing",
     { jobId: "pwsh_does_not_exist", action: "wait" },
@@ -595,7 +495,7 @@ test("action 'wait' on an unknown job reports not found", async () => {
 });
 
 test("action 'kill' on an unknown job reports not found instead of doing nothing", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
+  const { tool } = makeTool();
   const res = await tool.execute(
     "call_kill_missing",
     { jobId: "pwsh_no_such_job", action: "kill" },
@@ -616,24 +516,20 @@ test("renders 'Wait job <jobId>' card header when intent is omitted for action '
   expect(header).toContain(`Wait job ${jobId}`);
 });
 
-test("abort signal interrupts 'wait' action and detaches waiter so later completion still delivers", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
+test("falls back to 'Job status <jobId>' when a jobId carries no action", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const jobId = "pwsh_test_status_label";
+  const rows = tool
+    .renderCall({ jobId }, { argsComplete: true }, theme as never)
+    .render(80);
+  expect(Bun.stripANSI(rows[0] ?? "")).toContain(`Job status ${jobId}`);
+});
 
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_abort_start",
-    { command: "Start-Sleep -Milliseconds 600; Write-Output 'aborted-wait-finished'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+test("abort signal interrupts 'wait' action and detaches waiter so later completion still delivers", async () => {
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_abort_start", {
+    command: "Start-Sleep -Milliseconds 600; Write-Output 'aborted-wait-finished'",
+  });
 
   const controller = new AbortController();
   const waitPromise = tool.execute(
@@ -651,29 +547,15 @@ test("abort signal interrupts 'wait' action and detaches waiter so later complet
   expect(waitRes.content[0]?.text).toContain("still running");
   expect(sentMessages.length).toBe(0);
 
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  await getJobManager().getJob(jobId)?.settled;
   expect(sentMessages.length).toBe(1);
 });
 
 test("action 'wait' with timeout: 0 waits indefinitely until job completion", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_zero_start",
-    { command: "Start-Sleep -Milliseconds 300; Write-Output 'zero-timeout-finished'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_zero_start", {
+    command: "Start-Sleep -Milliseconds 300; Write-Output 'zero-timeout-finished'",
+  });
 
   const waitRes = await tool.execute(
     "call_wait_zero",
@@ -688,26 +570,12 @@ test("action 'wait' with timeout: 0 waits indefinitely until job completion", as
 });
 
 test("action 'wait' on an already settled job returns the shared snapshot without a new aside", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_settled_start", {
+    command: "Write-Output 'settled-before-wait'",
+  });
 
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_settled_start",
-    { command: "Write-Output 'settled-before-wait'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
-
-  const job = getJobManager().getJob(jobId);
-  await job?.settled;
+  await getJobManager().getJob(jobId)?.settled;
   // The job completed with no waiter attached, so the aside went out once.
   expect(sentMessages.length).toBe(1);
 
@@ -724,23 +592,10 @@ test("action 'wait' on an already settled job returns the shared snapshot withou
 });
 
 test("action 'wait' surfaces a failed job as an error result instead of an aside", async () => {
-  const sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  const fakePi = {
-    zod: zStub,
-    sendMessage(message: unknown, options: unknown) {
-      sentMessages.push({ message, options });
-    },
-  } as unknown as ExtensionAPI;
-
-  const tool = definePwshTool(fakePi);
-  const startRes = await tool.execute(
-    "call_wait_failed_start",
-    { command: "throw 'boom-failed'", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, sentMessages, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_failed_start", {
+    command: "throw 'boom-failed'",
+  });
 
   const waitRes = await tool.execute("call_wait_failed", { jobId, action: "wait" }, undefined, undefined);
 
@@ -753,18 +608,10 @@ test("action 'wait' surfaces a failed job as an error result instead of an aside
 });
 
 test("a wait racing job-manager disposal reports the killed job instead of not-found", async () => {
-  const tool = definePwshTool({
-    zod: zStub,
-    sendMessage() {},
-  } as unknown as ExtensionAPI);
-  const startRes = await tool.execute(
-    "call_wait_dispose_start",
-    { command: "Start-Sleep -Seconds 10", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, startJob } = makeTool();
+  const { jobId } = await startJob("call_wait_dispose_start", {
+    command: "Start-Sleep -Seconds 10",
+  });
 
   // Attach the waiter, then tear the manager down under it: `disposeAll` clears
   // the job map before the job settles, so the awaited handle — not a fresh
@@ -784,7 +631,7 @@ test("a wait racing job-manager disposal reports the killed job instead of not-f
 });
 
 test("foreground requests report a PowerShell-level exit code and keep earlier output", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
+  const { tool } = makeTool();
   const res = await tool.execute(
     "call_sync_exit",
     { command: "Write-Output 'sync-before-exit'; exit 3" },
@@ -800,15 +647,10 @@ test("foreground requests report a PowerShell-level exit code and keep earlier o
 });
 
 test("an async job that calls exit N fails with that code instead of reporting success", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
-  const startRes = await tool.execute(
-    "call_exit_job_start",
-    { command: "Write-Output 'job-before-exit'; exit 4", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, startJob } = makeTool();
+  const { jobId } = await startJob("call_exit_job_start", {
+    command: "Write-Output 'job-before-exit'; exit 4",
+  });
 
   const waitRes = await tool.execute("call_exit_job_wait", { jobId, action: "wait" }, undefined, undefined);
 
@@ -820,15 +662,10 @@ test("an async job that calls exit N fails with that code instead of reporting s
 });
 
 test("an async job that calls exit 0 still reports success", async () => {
-  const tool = definePwshTool({ zod: zStub, sendMessage() {} } as unknown as ExtensionAPI);
-  const startRes = await tool.execute(
-    "call_exit_zero_start",
-    { command: "Write-Output 'zero-ok'; exit 0", async: true },
-    undefined,
-    undefined,
-  );
-  const jobId = startRes.details.jobId ?? "";
-  expect(jobId).not.toBe("");
+  const { tool, startJob } = makeTool();
+  const { jobId } = await startJob("call_exit_zero_start", {
+    command: "Write-Output 'zero-ok'; exit 0",
+  });
 
   const waitRes = await tool.execute("call_exit_zero_wait", { jobId, action: "wait" }, undefined, undefined);
 
