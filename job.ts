@@ -37,6 +37,8 @@ export interface PwshJob {
   readonly settled: Promise<PwshJob>;
 }
 
+export type PwshWaitOutcome = "settled" | "timeout" | "aborted";
+
 export interface StartJobOptions {
   command: string;
   cwd: string;
@@ -49,6 +51,8 @@ export interface StartJobOptions {
 
 export class PwshJobManager {
   readonly #jobs = new Map<string, PwshJob>();
+  /** Jobs with a waiter blocked in `waitJob`; any entry suppresses that job's completion aside. */
+  readonly #waiters = new WeakMap<PwshJob, number>();
   readonly #pool: PwshSessionPool;
   #pi?: ExtensionAPI;
 
@@ -176,7 +180,7 @@ export class PwshJobManager {
         resolveSettled(job);
 
         // Auto-deliver completion notice via pi.sendMessage if available and not killed manually
-        if (job.status !== "killed" && this.#pi?.sendMessage) {
+        if (job.status !== "killed" && !this.#waiters.has(job) && this.#pi?.sendMessage) {
           this.#deliverCompletion(job);
         }
       }
@@ -195,6 +199,53 @@ export class PwshJobManager {
       job.endTime = Date.now();
     }
     return job;
+  }
+
+  /**
+   * Block until the job settles, `timeoutMs` elapses, or `signal` aborts.
+   * While a waiter is attached the completion aside is suppressed: the waiter
+   * returns the result itself, so the model never receives it twice. A timeout
+   * or abort detaches immediately, so a later completion still delivers.
+   */
+  async waitJob(
+    id: string,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<{ job: PwshJob; outcome: PwshWaitOutcome } | undefined> {
+    const job = this.#jobs.get(id);
+    if (!job) return undefined;
+    this.#waiters.set(job, (this.#waiters.get(job) ?? 0) + 1);
+    let onAbort: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (job.status !== "running") return { job, outcome: "settled" };
+
+      const aborted = new Promise<"aborted">((resolve) => {
+        if (signal?.aborted) {
+          resolve("aborted");
+          return;
+        }
+        if (!signal) return;
+        onAbort = () => resolve("aborted");
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      const timedOut = new Promise<"timeout">((resolve) => {
+        if (!Number.isFinite(timeoutMs)) return;
+        timer = setTimeout(() => resolve("timeout"), Math.max(0, timeoutMs));
+      });
+      const outcome = await Promise.race([
+        job.settled.then(() => "settled" as const),
+        aborted,
+        timedOut,
+      ]);
+      return { job, outcome };
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      const remaining = (this.#waiters.get(job) ?? 1) - 1;
+      if (remaining > 0) this.#waiters.set(job, remaining);
+      else this.#waiters.delete(job);
+    }
   }
 
   disposeAll(): void {

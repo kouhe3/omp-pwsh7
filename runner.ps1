@@ -31,10 +31,52 @@ function Send-ProtocolFrame {
     [Console]::Out.Flush()
 }
 
+# Request code that calls `exit N` stops its pipeline before the result frame is
+# built, so N would be lost: a host-less runspace has no host to receive
+# SetShouldExit, and the request never reaches the ExitCode assignment.  This
+# host exists only to record N.  Its UI discards everything by design - runner
+# stdout carries the base64 protocol, so host writes must never reach it (matching
+# the host-less runspace it replaces).
+class OmpRequestHostUI : System.Management.Automation.Host.PSHostUserInterface {
+    [System.Management.Automation.Host.PSHostRawUserInterface] $RawUI = $null
+    [string] ReadLine() { return $null }
+    [System.Security.SecureString] ReadLineAsSecureString() { return $null }
+    [void] Write([string] $value) { }
+    [void] Write([System.ConsoleColor] $foregroundColor, [System.ConsoleColor] $backgroundColor, [string] $value) { }
+    [void] WriteLine([string] $value) { }
+    [void] WriteLine([System.ConsoleColor] $foregroundColor, [System.ConsoleColor] $backgroundColor, [string] $value) { }
+    [void] WriteErrorLine([string] $value) { }
+    [void] WriteDebugLine([string] $message) { }
+    [void] WriteProgress([long] $sourceId, [System.Management.Automation.ProgressRecord] $record) { }
+    [void] WriteVerboseLine([string] $message) { }
+    [void] WriteWarningLine([string] $message) { }
+    [System.Collections.Generic.Dictionary[string, System.Management.Automation.PSObject]] Prompt([string] $caption, [string] $message, [System.Collections.ObjectModel.Collection[System.Management.Automation.Host.FieldDescription]] $descriptions) { return $null }
+    [int] PromptForChoice([string] $caption, [string] $message, [System.Collections.ObjectModel.Collection[System.Management.Automation.Host.ChoiceDescription]] $choices, [int] $defaultChoice) { return -1 }
+    [System.Management.Automation.PSCredential] PromptForCredential([string] $caption, [string] $message, [string] $userName, [string] $targetName) { return $null }
+    [System.Management.Automation.PSCredential] PromptForCredential([string] $caption, [string] $message, [string] $userName, [string] $targetName, [System.Management.Automation.PSCredentialTypes] $allowedCredentialTypes, [System.Management.Automation.PSCredentialUIOptions] $options) { return $null }
+}
+
+class OmpRequestHost : System.Management.Automation.Host.PSHost {
+    [string] $Name = 'omp-pwsh7'
+    [version] $Version = [version]'7.0'
+    [guid] $InstanceId = [guid]::NewGuid()
+    [System.Management.Automation.Host.PSHostUserInterface] $UI = [OmpRequestHostUI]::new()
+    [System.Globalization.CultureInfo] $CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+    [System.Globalization.CultureInfo] $CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
+    # -1 means the request did not exit; any value >= 0 is its `exit N` code.
+    [int] $LastExit = -1
+    [void] SetShouldExit([int] $exitCode) { $this.LastExit = $exitCode }
+    [void] EnterNestedPrompt() { }
+    [void] ExitNestedPrompt() { }
+    [void] NotifyBeginApplication() { }
+    [void] NotifyEndApplication() { }
+}
+
 # The user runspace is intentionally not exposed to request code.  Unlike a
 # child PowerShell scope, it retains variables, functions, and imported modules
 # between invocations while leaving this protocol scope inaccessible.
-$userRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+$requestHost = [OmpRequestHost]::new()
+$userRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace([System.Management.Automation.Host.PSHost]$requestHost)
 $userRunspace.Open()
 
 try {
@@ -60,7 +102,7 @@ try {
         # shared protocol scope, so request code cannot discover or replace its
         # snapshot/dispatcher/setter variables.
 $result = & (New-Module -ScriptBlock {}) {
-            param($request, $persistentRunspace, $defaultWidth, $sendFrame)
+            param($request, $persistentRunspace, $defaultWidth, $sendFrame, $requestHost)
             $envState = @()
             $seenEnvKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $width = $defaultWidth
@@ -131,6 +173,7 @@ $runnerResult.PSObject.TypeNames.Insert(0, 'Omp.Pwsh.RunnerResult')
 $runnerResult
 '@
                 $null = $ps.AddScript($executionScript).AddArgument([string]$request.code).AddArgument($request.format).AddArgument($width)
+                $requestHost.LastExit = -1
                 $asyncResult = $ps.BeginInvoke[psobject, psobject]($null, $outputBuffer)
 
                 # Output collection events fire while the pipeline is running, so
@@ -179,6 +222,11 @@ $runnerResult
                     # Reconstruct the same final text exposed by streamed chunks.
                     $output = if ($textLines.Count -gt 0) { ($textLines -join "`n") + "`n" } else { $null }
                 }
+                # `exit N` stops the pipeline before the runner result frame is
+                # emitted, so the host-recorded code is the only source for it.
+                if ($requestHost.LastExit -ge 0) {
+                    $exitCode = $requestHost.LastExit
+                }
                 if ($ps.HadErrors) {
                     $errorText = (($ps.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n")
                 }
@@ -201,7 +249,7 @@ $runnerResult
                 ErrorText = $errorText
                 ExitCode = $exitCode
             }
-        } $req $userRunspace $DEFAULT_WIDTH ${function:Send-ProtocolFrame}
+        } $req $userRunspace $DEFAULT_WIDTH ${function:Send-ProtocolFrame} $requestHost
 
         Send-ProtocolFrame @{
             type = 'result'

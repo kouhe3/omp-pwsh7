@@ -23,7 +23,7 @@ import {
   type Theme,
 } from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
-import { PwshJobManager, type PwshJobStatus } from "./job";
+import { PwshJobManager, type PwshJob, type PwshJobStatus } from "./job";
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -49,7 +49,7 @@ export interface PwshParams {
   session?: string;
   async?: boolean;
   jobId?: string;
-  action?: "status" | "kill";
+  action?: "status" | "kill" | "wait";
 }
 
 export interface PwshDetails {
@@ -289,9 +289,42 @@ function normalizeTimeout(value: number | undefined): number {
   );
 }
 
+/** Shared status/wait snapshot text for one job (terminal or in-flight). */
+function jobSnapshotText(job: PwshJob): string {
+  const durationSec = ((job.endTime ?? Date.now()) - job.startTime) / 1000;
+  return [
+    `Job '${job.id}' (${job.status}, ${durationSec.toFixed(1)}s)`,
+    job.exitCode != null ? `Exit code: ${job.exitCode}` : undefined,
+    job.output.trim() ? `Output:\n${job.output.trim()}` : undefined,
+    job.error ? `Error: ${job.error}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function normalizeWidth(value: number | undefined): number {
   if (value === undefined) return DEFAULT_WIDTH;
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(value)));
+}
+
+/** Details payload shared by job-control, status, and wait results. */
+function jobDetails(
+  job: PwshJob,
+  params: PwshParams,
+  cwd: string,
+  error = job.error ?? "",
+): PwshDetails {
+  return {
+    ...emptyDetails(params, cwd, error),
+    async: true,
+    jobId: job.id,
+    status: job.status,
+    command: job.command,
+    output: job.output,
+    exitCode: job.exitCode,
+    timeoutSec: job.timeoutSec,
+    wallTimeMs: (job.endTime ?? Date.now()) - job.startTime,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +372,11 @@ export function definePwshTool(pi: ExtensionAPI) {
         .optional()
         .describe("job ID of an async background job to inspect or stop"),
       action: z
-        .enum(["status", "kill"])
+        .enum(["status", "kill", "wait"])
         .optional()
-        .describe("action for background job: 'status' to inspect, 'kill' to stop"),
+        .describe(
+          "action for background job: 'status' to inspect, 'kill' to stop, 'wait' to block until it settles (timeout bounds the wait, default 120s, 0 waits indefinitely)",
+        ),
       cwd: z
         .string()
         .optional()
@@ -398,52 +433,66 @@ export function definePwshTool(pi: ExtensionAPI) {
 
       // Branch 1: Job control via jobId
       if (params.jobId) {
-        if (params.action === "kill") {
-          const job = jm.getJob(params.jobId);
-          if (!job) {
-            const err = `Job '${params.jobId}' not found.`;
-            return {
-              content: [{ type: "text" as const, text: err }],
-              details: emptyDetails(params, cwd, err),
-              isError: true,
-            };
-          }
+        // Job handle shared by all three actions. Resolving it up front matters
+        // for the wait: `disposeAll` (session shutdown) clears the job map, so a
+        // lookup taken after the settle would report not-found for a job the
+        // waiter already observed. A missing job falls through to the shared
+        // not-found below.
+        let job = jm.getJob(params.jobId);
+
+        if (params.action === "kill" && job) {
           if (job.status !== "running") {
             const text = `Job '${job.id}' is not running (status: ${job.status}).`;
             return {
               content: [{ type: "text" as const, text }],
-              details: {
-                ...emptyDetails(params, cwd, ""),
-                async: true,
-                jobId: job.id,
-                status: job.status,
-                command: job.command,
-                output: job.output,
-                exitCode: job.exitCode,
-                timeoutSec: job.timeoutSec,
-                wallTimeMs: (job.endTime ?? Date.now()) - job.startTime,
-              },
+              details: jobDetails(job, params, cwd, ""),
             };
           }
           const killed = jm.killJob(params.jobId)!;
           const text = `PowerShell background job '${killed.id}' killed.`;
           return {
             content: [{ type: "text" as const, text }],
-            details: {
-              ...emptyDetails(params, cwd, ""),
-              async: true,
-              jobId: killed.id,
-              status: "killed",
-              command: killed.command,
-              output: killed.output,
-              timeoutSec: killed.timeoutSec,
-              wallTimeMs: (killed.endTime ?? Date.now()) - killed.startTime,
-            },
+            details: jobDetails(killed, params, cwd, ""),
           };
         }
 
-        // Default or action: "status"
-        const job = jm.getJob(params.jobId);
+        // action: "wait" - block until settlement, the wait budget, or abort.
+        // Only the still-running outcome is wait-specific; a settled job and an
+        // unknown id both fall through to the shared snapshot below.
+        if (params.action === "wait") {
+          const budgetSec = normalizeTimeout(params.timeout);
+          const waited = await jm.waitJob(
+            params.jobId,
+            signal,
+            budgetSec > 0 ? budgetSec * 1000 : Infinity,
+          );
+          if (waited && waited.job.status === "running") {
+            // Wait budget elapsed or the caller aborted: detach and snapshot.
+            const pendingJob = waited.job;
+            const elapsedSec = (
+              ((pendingJob.endTime ?? Date.now()) - pendingJob.startTime) /
+              1000
+            ).toFixed(1);
+            const reason =
+              waited.outcome === "aborted"
+                ? "Wait aborted"
+                : `Wait timed out after ${budgetSec}s`;
+            const text = [
+              `${reason}; job '${pendingJob.id}' is still running (${elapsedSec}s).`,
+              pendingJob.output.trim()
+                ? `Output so far:\n${pendingJob.output.trim()}`
+                : undefined,
+            ]
+              .filter(Boolean)
+              .join("\n");
+            return {
+              content: [{ type: "text" as const, text }],
+              details: jobDetails(pendingJob, params, cwd, ""),
+            };
+          }
+        }
+
+        // Default, action: "status", or a wait that already settled
         if (!job) {
           const err = `Job '${params.jobId}' not found.`;
           return {
@@ -453,30 +502,11 @@ export function definePwshTool(pi: ExtensionAPI) {
           };
         }
 
-        const durationMs = (job.endTime ?? Date.now()) - job.startTime;
-        const durationSec = (durationMs / 1000).toFixed(1);
-        const text = [
-          `Job '${job.id}' (${job.status}, ${durationSec}s)`,
-          job.exitCode != null ? `Exit code: ${job.exitCode}` : undefined,
-          job.output.trim() ? `Output:\n${job.output.trim()}` : undefined,
-          job.error ? `Error: ${job.error}` : undefined,
-        ]
-          .filter(Boolean)
-          .join("\n");
+        const text = jobSnapshotText(job);
 
         return {
           content: [{ type: "text" as const, text }],
-          details: {
-            ...emptyDetails(params, cwd, job.error ?? ""),
-            async: true,
-            jobId: job.id,
-            status: job.status,
-            command: job.command,
-            output: job.output,
-            exitCode: job.exitCode,
-            timeoutSec: job.timeoutSec,
-            wallTimeMs: durationMs,
-          },
+          details: jobDetails(job, params, cwd),
           isError: job.status === "failed",
         };
       }
@@ -504,7 +534,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         const text = [
           `Background job '${job.id}' started.`,
           `Command: ${job.command}`,
-          `The result will be delivered automatically upon completion. Inspect with { jobId: "${job.id}" } or stop with { jobId: "${job.id}", action: "kill" }.`,
+          `The result will be delivered automatically upon completion. Wait with { jobId: "${job.id}", action: "wait" }, inspect with { jobId: "${job.id}" }, or stop with { jobId: "${job.id}", action: "kill" }.`,
         ].join("\n");
 
         return {

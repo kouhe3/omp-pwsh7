@@ -273,7 +273,12 @@ function callLabel(args: {
   if (intent.length > 0) return intent;
   if (typeof args.jobId === "string" && args.jobId.trim().length > 0) {
     const cleanJobId = args.jobId.replace(/\s+/g, " ").trim();
-    const action = args.action === "kill" ? "Kill job" : "Job status";
+    const action =
+      args.action === "kill"
+        ? "Kill job"
+        : args.action === "wait"
+          ? "Wait job"
+          : "Job status";
     return `${action} ${cleanJobId}`;
   }
   return TOOL_LABEL;
