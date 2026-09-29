@@ -224,9 +224,18 @@ $runnerResult
                 }
                 # `exit N` stops the pipeline before the runner result frame is
                 # emitted, so the host-recorded code is the only source for it.
+                #
+                # This is a self-report, not tamper-proof evidence: request code
+                # can call `$Host.SetShouldExit(N)` itself. Verified - a script
+                # that runs `cmd /c exit 3` and then calls
+                # `$Host.SetShouldExit(0)` reports exit code 0, so treat a
+                # non-zero code as "the script said it failed", never a zero
+                # code as proof that it succeeded. Reset after reading so no
+                # code can outlive the request that produced it.
                 if ($requestHost.LastExit -ge 0) {
                     $exitCode = $requestHost.LastExit
                 }
+                $requestHost.LastExit = -1
                 if ($ps.HadErrors) {
                     $errorText = (($ps.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n")
                 }

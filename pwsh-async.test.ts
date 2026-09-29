@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { definePwshTool, getJobManager, resetJobManager } from "./pwsh-tool";
-import { PwshJobManager } from "./job";
+import { MAX_RETAINED_SETTLED_JOBS, PwshJobManager } from "./job";
 import type { PwshSessionPool } from "./session";
 
 // Mock schema builder similar to zod
@@ -258,6 +258,34 @@ test("disposes worker session in pool upon job completion to prevent subprocess 
   expect(disposedKeys).toContain(`async:${job.id}`);
 });
 
+test("retains only the newest settled jobs and evicts the oldest", async () => {
+  const fakePool = {
+    getOrCreate: () => ({
+      run: async () => ({ response: { output: "done", exitCode: 0 } }),
+    }),
+    dispose: () => {},
+  } as unknown as PwshSessionPool;
+
+  const jm = new PwshJobManager(fakePool);
+  const total = MAX_RETAINED_SETTLED_JOBS + 5;
+  const ids: string[] = [];
+  for (let index = 0; index < total; index++) {
+    const job = jm.startJob({
+      command: `Write-Output 'job-${index}'`,
+      cwd: process.cwd(),
+    });
+    ids.push(job.id);
+    await job.settled;
+  }
+
+  // Each job holds up to 1 MB of output, so the map is bounded by count.
+  expect(jm.listJobs().length).toBe(MAX_RETAINED_SETTLED_JOBS);
+  // The newest stay addressable; the oldest are gone.
+  expect(jm.getJob(ids[total - 1]!)).toBeDefined();
+  expect(jm.getJob(ids[total - MAX_RETAINED_SETTLED_JOBS]!)).toBeDefined();
+  expect(jm.getJob(ids[0]!)).toBeUndefined();
+});
+
 test("reports accurate status and wall time when inspecting a finished job", async () => {
   const { tool, startJob } = makeTool();
 
@@ -303,6 +331,99 @@ test("callLabel sanitizes multi-line jobId and prevents visual frame splitting",
   const header = rows[0]!;
   expect(header).not.toContain("\n");
   expect(header).toContain("Kill job pwsh_1234 malicious_line");
+});
+
+test("strips terminal control sequences from the card title, cwd, and command", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  // An OSC 52 clipboard write plus a clear-screen CSI, as a model-authored
+  // argument or a script's output would carry them.
+  const evil = "\u001b[2J\u001b]52;c;aGk=\u0007";
+
+  const rows = tool
+    .renderCall(
+      {
+        i: `Kill${evil} jobs`,
+        command: `Write-Output '${evil}safe'`,
+        cwd: `sub${evil}dir`,
+      },
+      { argsComplete: true },
+      theme,
+    )
+    .render(80);
+
+  const card = rows.join("\n");
+  const plain = Bun.stripANSI(card);
+  // The sequences are gone; the text around them is not.
+  expect(plain).toContain("Kill jobs");
+  expect(plain).toContain("subdir");
+  expect(plain).toContain("Write-Output 'safe'");
+  expect(card).not.toContain("\u001b[2J");
+  expect(card).not.toContain("\u001b]52;");
+  expect(card).not.toContain("\u0007");
+});
+
+test("strips control sequences from job output and error text in the card body", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const evil = "\u001b]52;c;aGk=\u0007\u001b[2J";
+
+  const rows = tool
+    .renderResult(
+      {
+        details: {
+          cwd: process.cwd(),
+          sessionKey: "k",
+          format: "text",
+          timeoutSec: 120,
+          wallTimeMs: 12,
+          async: true,
+          jobId: "pwsh_clean",
+          status: "completed",
+          output: `before ${evil} after\n`,
+        },
+      },
+      { expanded: false },
+      theme,
+      { jobId: "pwsh_clean", action: "status" },
+    )
+    .render(80);
+
+  const card = rows.join("\n");
+  expect(Bun.stripANSI(card)).toContain("before  after");
+  expect(card).not.toContain("\u001b]52;");
+  expect(card).not.toContain("\u001b[2J");
+});
+
+test("strips control sequences from the jobId tag in the status row", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const evilJobId = "pwsh_x\u001b[2J\u001b]52;c;aGk=\u0007";
+
+  const rows = tool
+    .renderResult(
+      {
+        details: {
+          cwd: process.cwd(),
+          sessionKey: "k",
+          format: "text",
+          timeoutSec: 120,
+          wallTimeMs: 5,
+          async: true,
+          jobId: evilJobId,
+          status: "running",
+          command: "Start-Sleep 10",
+          output: "",
+        },
+      },
+      { expanded: false },
+      theme,
+      { jobId: evilJobId, action: "status" },
+    )
+    .render(80);
+
+  const card = rows.join("\n");
+  expect(card).toContain("pwsh_x");
+  expect(card).not.toContain("\u001b[2J");
+  expect(card).not.toContain("\u001b]52;");
+  expect(card).not.toContain("\u0007");
 });
 
 test("renders failed async job with failed indicator rather than false completed", () => {

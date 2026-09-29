@@ -48,6 +48,33 @@ function visibleLength(text: string): number {
 }
 
 /**
+ * C0/C1 controls (ESC included) minus tab and newline. Mirrors the host's
+ * `sanitizeText` (`@oh-my-pi/pi-utils`): tab and newline are structure the card
+ * re-wraps itself, everything else a terminal would interpret is dropped.
+ */
+const TERMINAL_CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
+
+/**
+ * Strip terminal control sequences from untrusted text: the model's intent /
+ * jobId / cwd, command output, script errors.
+ *
+ * The card is this tool's only sanitization point. The host renders custom
+ * renderer rows verbatim (`SafeToolRendererComponent.render` returns them
+ * unchanged, `chat/tool-execution.ts`), so an OSC 52 clipboard sequence in a
+ * job's output would otherwise be written straight to the user's terminal.
+ *
+ * Call it on *raw* text only: the theme colors and Shiki highlights composed
+ * afterwards are ours and must survive (sanitizing a composed row would strip
+ * the card's own styling).
+ */
+function sanitizeTerminalText(text: string): string {
+  TERMINAL_CONTROL_RE.lastIndex = 0;
+  if (TERMINAL_CONTROL_RE.exec(text) === null) return text;
+  TERMINAL_CONTROL_RE.lastIndex = 0;
+  return Bun.stripANSI(text).replace(TERMINAL_CONTROL_RE, "");
+}
+
+/**
  * Slice a possibly-ANSI-colored string to `max` visible columns, preserving
  * escapes. A truncation spends one of those columns on `…`, so the result never
  * exceeds `max` — appending the ellipsis on top of a full-budget slice pushed
@@ -247,7 +274,9 @@ export const TOOL_LABEL = "PowerShell 7";
  * every card both repeats itself and eats the header's width budget.
  */
 function frameTitle(theme: Theme, label: string, cwd?: string): string {
-  const body = ` ${label}${cwd ? ` · ${cwd}` : ""}`;
+  const safeLabel = sanitizeTerminalText(label);
+  const safeCwd = cwd ? sanitizeTerminalText(cwd) : "";
+  const body = ` ${safeLabel}${safeCwd ? ` · ${safeCwd}` : ""}`;
   return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
 }
 
@@ -262,6 +291,10 @@ function frameTitle(theme: Theme, label: string, cwd?: string): string {
  * Whitespace runs collapse to one space: a model-authored intent can carry a
  * newline, and a newline inside a rendered row splits the frame in the terminal.
  * The host flattens intent text for the same reason (`renderStatusLine`).
+ *
+ * Control sequences are stripped before the row is composed: `i` and `jobId` are
+ * model-authored, so a raw ESC here reaches the terminal unfiltered (see
+ * `sanitizeTerminalText`).
  */
 function callLabel(args: {
   i?: unknown;
@@ -269,10 +302,14 @@ function callLabel(args: {
   action?: unknown;
 }): string {
   const intent =
-    typeof args.i === "string" ? args.i.replace(/\s+/g, " ").trim() : "";
+    typeof args.i === "string"
+      ? sanitizeTerminalText(args.i).replace(/\s+/g, " ").trim()
+      : "";
   if (intent.length > 0) return intent;
   if (typeof args.jobId === "string" && args.jobId.trim().length > 0) {
-    const cleanJobId = args.jobId.replace(/\s+/g, " ").trim();
+    const cleanJobId = sanitizeTerminalText(args.jobId)
+      .replace(/\s+/g, " ")
+      .trim();
     if (args.action === "kill") return `Kill job ${cleanJobId}`;
     if (args.action === "wait") return `Wait job ${cleanJobId}`;
     return `Job status ${cleanJobId}`;
@@ -329,7 +366,7 @@ function pendingCallRow(theme: Theme, label: string): string {
  * re-assembling it: a missing prefix is one column of drift.
  */
 export function renderPendingRow(theme: Theme, label: string): string {
-  return ` ${pendingCallRow(theme, label)}`;
+  return ` ${pendingCallRow(theme, sanitizeTerminalText(label))}`;
 }
 
 const PREVIEW_LINES_COLLAPSED = 6;
@@ -352,6 +389,15 @@ export interface PwshRenderOptions {
   argsComplete?: boolean;
 }
 
+/**
+ * ` [jobId]` tag for a running/killed job: control-free and single-line, so a
+ * model-authored id cannot break the status row it is drawn into.
+ */
+function jobTag(jobId: string | undefined): string {
+  if (!jobId) return "";
+  return ` [${sanitizeTerminalText(jobId).replace(/\s+/g, " ").trim()}]`;
+}
+
 /** Status icon + label for the divider line (exit-code aware). */
 function renderStatusLabel(
   d: PwshDetails,
@@ -360,12 +406,10 @@ function renderStatusLabel(
   isPartial = false,
 ): string {
   if (d.async && d.status === "running") {
-    const jobTag = d.jobId ? ` [${d.jobId.replace(/\s+/g, " ").trim()}]` : "";
-    return `${theme.fg("accent", "●")} running${jobTag}`;
+    return `${theme.fg("accent", "●")} running${jobTag(d.jobId)}`;
   }
   if (d.status === "killed") {
-    const jobTag = d.jobId ? ` [${d.jobId.replace(/\s+/g, " ").trim()}]` : "";
-    return `${theme.fg("error", "◼")} killed${jobTag}`;
+    return `${theme.fg("error", "◼")} killed${jobTag(d.jobId)}`;
   }
   if (isPartial || d.streaming) {
     return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
@@ -435,15 +479,18 @@ export function commandBlock(
     formatToolWorkingDirectory(cwd, process.cwd()),
   );
   const out: string[] = [frameTop(width, theme, title)];
-  if (command.trim().length === 0) {
+  // Sanitize before highlighting: `highlightPowerShell` output carries the
+  // theme's own escape sequences, so only the raw source can be filtered.
+  const source = sanitizeTerminalText(command);
+  if (source.trim().length === 0) {
     if (closed) out.push(frameBottom(width, theme));
     return out;
   }
   let lines: string[];
   try {
-    lines = highlightPowerShell(command, theme);
+    lines = highlightPowerShell(source, theme);
   } catch {
-    lines = command.split("\n");
+    lines = source.split("\n");
   }
   // A trailing newline in the submitted command is not a command line.
   while (lines.length > 1 && lines[lines.length - 1]!.trim() === "") lines.pop();
@@ -475,11 +522,11 @@ function renderBody(
   theme: Theme,
   width: number,
 ): string[] {
-  // Normalize CRLF: pwsh emits \r\n frames that would make the terminal
-  // cursor jump back to line start (blank-looking rows).
-  const body = (d.error ?? d.output ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
+  // Output and error text come from the script, not from us: strip control
+  // sequences before they reach the terminal. CR is one of them, which also
+  // disposes of the CRLF frames pwsh emits (they would otherwise make the
+  // cursor jump back to the line start and render as blank rows).
+  const body = sanitizeTerminalText(d.error ?? d.output ?? "");
   if (!body) return [];
   const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
   // Out-String pads leading/trailing blank lines (CRLF frames); trim both

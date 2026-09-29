@@ -15,6 +15,13 @@ const MAX_JOB_OUTPUT_CHARS = 1024 * 1024;
 /** Maximum output characters included in the async completion message sent to the agent prompt (16 KB). */
 const MAX_DELIVERY_OUTPUT_CHARS = 16 * 1024;
 
+/**
+ * Settled jobs kept addressable by id. Each retains up to 1 MB of output, and a
+ * long session that keeps starting background work would otherwise grow the job
+ * map without bound; the newest `N` by settle time stay inspectable.
+ */
+export const MAX_RETAINED_SETTLED_JOBS = 32;
+
 const DEFAULT_TIMEOUT_SEC = 120;
 
 export type PwshJobStatus = "running" | "completed" | "failed" | "killed";
@@ -183,10 +190,33 @@ export class PwshJobManager {
         if (job.status !== "killed" && !this.#waiters.has(job) && this.#pi?.sendMessage) {
           this.#deliverCompletion(job);
         }
+        this.#pruneSettledJobs();
       }
     })();
 
     return job;
+  }
+
+  /**
+   * Drop the oldest settled jobs once more than {@link MAX_RETAINED_SETTLED_JOBS}
+   * are retained, newest by settle time first. Running jobs and jobs with a
+   * waiter attached stay: the waiter already holds the handle and must be able
+   * to return it, and a wait that outlives its job still has to find it.
+   */
+  #pruneSettledJobs(): void {
+    const settled: PwshJob[] = [];
+    for (const job of this.#jobs.values()) {
+      if (job.status === "running" || this.#waiters.has(job)) continue;
+      settled.push(job);
+    }
+    if (settled.length <= MAX_RETAINED_SETTLED_JOBS) return;
+    settled.sort((a, b) => (a.endTime ?? 0) - (b.endTime ?? 0));
+    for (const job of settled.slice(
+      0,
+      settled.length - MAX_RETAINED_SETTLED_JOBS,
+    )) {
+      this.#jobs.delete(job.id);
+    }
   }
 
   killJob(id: string): PwshJob | undefined {
