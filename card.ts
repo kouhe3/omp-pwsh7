@@ -281,30 +281,34 @@ function frameTitle(theme: Theme, label: string, cwd?: string): string {
 }
 
 /**
- * Card title text for a call: the model's intent, falling back to the tool name.
+ * One-line, control-free form of a model-authored intent.
  *
- * `i` is read from the *streamed* tool-call JSON, which can carry a non-string
+ * Whitespace runs collapse to one space: a newline inside a rendered row splits
+ * the frame in the terminal. Control sequences are stripped because `i` and
+ * `jobId` are model-authored, so a raw ESC here reaches the terminal unfiltered
+ * (see `sanitizeTerminalText`).
+ */
+export function oneLineIntent(intent: unknown): string {
+  return typeof intent === "string"
+    ? sanitizeTerminalText(intent).replace(/\s+/g, " ").trim()
+    : "";
+}
+
+/**
+ * Title text a call declares itself: the model's intent, else the job-control
+ * action, else the tool label.
+ *
+ * `i` comes from the *streamed* tool-call JSON, which can carry a non-string
  * (number/object/boolean) before schema validation — the host guards for this at
  * its own callsite. `?.` alone would throw `args.i.trim is not a function`, and a
  * throwing renderer makes the host substitute a bare label line.
- *
- * Whitespace runs collapse to one space: a model-authored intent can carry a
- * newline, and a newline inside a rendered row splits the frame in the terminal.
- * The host flattens intent text for the same reason (`renderStatusLine`).
- *
- * Control sequences are stripped before the row is composed: `i` and `jobId` are
- * model-authored, so a raw ESC here reaches the terminal unfiltered (see
- * `sanitizeTerminalText`).
  */
 function callLabel(args: {
   i?: unknown;
   jobId?: unknown;
   action?: unknown;
 }): string {
-  const intent =
-    typeof args.i === "string"
-      ? sanitizeTerminalText(args.i).replace(/\s+/g, " ").trim()
-      : "";
+  const intent = oneLineIntent(args.i);
   if (intent.length > 0) return intent;
   if (typeof args.jobId === "string" && args.jobId.trim().length > 0) {
     const cleanJobId = sanitizeTerminalText(args.jobId)
@@ -318,27 +322,45 @@ function callLabel(args: {
 }
 
 /**
- * Intent seen while the args streamed, keyed by the host's render-state object:
- * one object per card, handed to both `renderCall` and `renderResult`
- * (`tool-execution.ts`, `#renderState`).
+ * Intent seen for one call, keyed by its args object.
  *
- * The host reconciles the args at `tool_execution_start` with the *validated*
- * object, and intent tracing strips `i` out of it (`agent-loop.ts`:
- * `extractIntent` -> `effectiveArgs` -> `event.args`). Without this memo the
- * finished card — the one the user keeps on screen — falls back to the tool
- * label while the pending row and a rebuilt transcript both show the intent.
+ * Never keyed by the host's render-state object: an extension tool's hooks go
+ * through `RegisteredToolAdapter`, which hands `renderCall` a fresh Proxy of the
+ * render state and `renderResult` a fresh `{expanded,isPartial,spinnerFrame}`
+ * literal (`extensibility/extensions/wrapper.ts`), so that object identifies
+ * nothing across the two hooks. The args reference survives the adapter, and
+ * `tool_execution_start` hands the extension the very same object the renderers
+ * later receive (`agent-loop.ts`: `stream.push({args: effectiveArgs})` is the
+ * object `#getCallArgsForRender`/`renderResult` see) — which is what makes the
+ * intent recoverable after intent tracing stripped `i` out of the parameters
+ * (`extractIntent` -> `effectiveArgs`).
  */
-const streamedIntents = new WeakMap<object, string>();
+const intentsByArgs = new WeakMap<object, string>();
 
-/** Title for one card: the args' intent while they still carry it, else the memo. */
+/** Record the intent declared for one call's args object (see `intentsByArgs`). */
+export function rememberIntent(args: unknown, intent: unknown): void {
+  const clean = oneLineIntent(intent);
+  if (clean.length === 0 || typeof args !== "object" || args === null) return;
+  intentsByArgs.set(args, clean);
+}
+
+/** Intent already recorded for one call's args object, if any. */
+function recordedIntent(args: unknown): string | undefined {
+  return typeof args === "object" && args !== null
+    ? intentsByArgs.get(args)
+    : undefined;
+}
+
+/** Title for one card: the args' own intent, else the recorded one, else the tool label. */
 export function callTitle(
-  options: PwshRenderOptions,
   args: { i?: unknown; jobId?: unknown; action?: unknown } | undefined,
 ): string {
   const fromArgs = callLabel(args ?? {});
-  if (fromArgs === TOOL_LABEL) return streamedIntents.get(options) ?? TOOL_LABEL;
-  streamedIntents.set(options, fromArgs);
-  return fromArgs;
+  if (fromArgs !== TOOL_LABEL) {
+    rememberIntent(args, fromArgs);
+    return fromArgs;
+  }
+  return recordedIntent(args) ?? TOOL_LABEL;
 }
 
 /**

@@ -6,7 +6,11 @@
  * imports are paid once. Protocol and runner live in `session.ts`/`runner.ps1`.
  * Card rendering lives in `card.ts`, syntax highlighting in `syntax.ts`.
  */
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolExecutionStartEvent,
+} from "@oh-my-pi/pi-coding-agent";
 // Host-owned pi-tui instance (OMP rewrites every `@oh-my-pi/pi-*` specifier in
 // extension sources to the module it already has loaded). Required because the
 // framed-block mark is a module-private Symbol: a copy from our own
@@ -16,6 +20,8 @@ import {
   TOOL_LABEL,
   callTitle,
   commandBlock,
+  oneLineIntent,
+  rememberIntent,
   renderCard,
   renderPendingRow,
   type PwshRenderOptions,
@@ -23,7 +29,12 @@ import {
   type Theme,
 } from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
-import { PwshJobManager, type PwshJob, type PwshJobStatus } from "./job";
+import {
+  PwshJobManager,
+  jobsReport,
+  type PwshJob,
+  type PwshJobStatus,
+} from "./job";
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -352,9 +363,109 @@ function jobDetails(
 // through `card.ts` (host instance of pi-tui, see the import at the top).
 // ---------------------------------------------------------------------------
 
+/** Footer key for the pwsh job count. One key per extension feature. */
+const JOBS_STATUS_KEY = "pwsh-jobs";
+
+/**
+ * Intent per tool-call id, for labels read long after `execute` returned.
+ *
+ * The args-keyed memo (`card.ts`) cannot serve those: the host may hand
+ * `execute` a *copy* of the args (`transformToolCallArguments` clamps
+ * `timeout`, `deobfuscateToolArguments` rebuilds the object), while the id is
+ * the same value in both places — `tool_execution_start.toolCallId` and
+ * `execute`'s first argument.
+ */
+const intentsByCallId = new Map<string, string>();
+
+/** Call ids whose intent stays addressable; a label is read within a job's life. */
+const MAX_REMEMBERED_CALLS = 64;
+
+/** Record one call's intent under its id, evicting the oldest ids past the cap. */
+function rememberCallIntent(toolCallId: string, intent: string): void {
+  if (toolCallId.length === 0 || intent.length === 0) return;
+  // Re-insert so the eviction order stays "least recently recorded".
+  intentsByCallId.delete(toolCallId);
+  intentsByCallId.set(toolCallId, intent);
+  while (intentsByCallId.size > MAX_REMEMBERED_CALLS) {
+    const oldest = intentsByCallId.keys().next();
+    if (oldest.done) return;
+    intentsByCallId.delete(oldest.value);
+  }
+}
+
+/**
+ * Live UI context, captured from the first tool event. Hook status is
+ * push-based — the host renders the last string it was handed and polls
+ * nothing — so the context is kept to refresh the footer when a job settles
+ * with no tool event of its own.
+ */
+let jobsStatusCtx: ExtensionContext | undefined;
+
+/**
+ * Publish the pwsh job count in the footer, clearing the segment at zero.
+ *
+ * The host's own job badge reads `AsyncJobManager` (bash/task/eval jobs) and
+ * cannot see the extension's pool, so the count goes out as a hook status
+ * (`ctx.ui.setStatus` → the status line's `status` segment).
+ */
+function refreshJobsStatus(ctx?: ExtensionContext): void {
+  // Only a UI-bearing context may own the footer slot. A subagent session
+  // re-binds this module's factories without re-importing it, so module state
+  // is shared with the child — and the child's context reports `hasUI: false`
+  // against a no-op UI (`runner.ts`: `#uiContext !== noOpUIContext`). Letting
+  // it overwrite the slot would freeze the interactive footer, because the
+  // reset a settling job writes would land on that no-op UI.
+  if (ctx?.hasUI === true) jobsStatusCtx = ctx;
+  const ui = jobsStatusCtx?.ui;
+  if (!ui) return;
+  const running =
+    jobManager?.listJobs().filter((job) => job.status === "running").length ?? 0;
+  ui.setStatus(
+    JOBS_STATUS_KEY,
+    running > 0 ? `pwsh ${running} running` : undefined,
+  );
+}
+
+/**
+ * Footer count and `/pwsh` listing for the pwsh pool.
+ *
+ * `tool_execution_start` also captures the card title's intent: the event
+ * carries the host's own `intent` plus the exact args object the renderers
+ * receive *after* intent tracing stripped `i` (see `card.ts` `intentsByArgs`).
+ *
+ * The `typeof` guards keep the test stubs working: `definePwshTool` is also
+ * called with a schema-only host object, where neither bus exists.
+ */
+function installJobsUi(pi: ExtensionAPI, jobs: PwshJobManager): void {
+  jobs.setJobsChangedListener(() => refreshJobsStatus());
+  if (typeof pi.on === "function") {
+    pi.on(
+      "tool_execution_start",
+      (event: ToolExecutionStartEvent, ctx: ExtensionContext) => {
+        if (event.toolName !== "pwsh") return;
+        rememberIntent(event.args, event.intent);
+        rememberCallIntent(event.toolCallId, oneLineIntent(event.intent));
+        refreshJobsStatus(ctx);
+      },
+    );
+    pi.on("tool_execution_end", (event, ctx) => {
+      if (event.toolName === "pwsh") refreshJobsStatus(ctx);
+    });
+  }
+  if (typeof pi.registerCommand === "function") {
+    pi.registerCommand("pwsh", {
+      description: "List PowerShell background jobs",
+      handler: async (_args: string, ctx: ExtensionContext) => {
+        refreshJobsStatus(ctx);
+        ctx.ui.notify(jobsReport(jobs.listJobs()), "info");
+      },
+    });
+  }
+}
+
 export function definePwshTool(pi: ExtensionAPI) {
   // Ensure the background job manager is initialized and bound to the host ExtensionAPI.
-  getJobManager(pi);
+  installJobsUi(pi, getJobManager(pi));
   const z = pi.zod;
   return {
     name: "pwsh",
@@ -427,7 +538,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         .describe("custom session name to isolate the process pool"),
     }),
     async execute(
-      _toolCallId: string,
+      toolCallId: string,
       params: PwshParams,
       signal: AbortSignal | undefined,
       onUpdate:
@@ -519,6 +630,12 @@ export function definePwshTool(pi: ExtensionAPI) {
           command: params.command,
           cwd,
           intent: params.i,
+          // `i` is stripped from the parameters before `execute` runs (intent
+          // tracing), so the label is recovered from what the
+          // `tool_execution_start` hook recorded for this call id — by delivery
+          // time, always there. Read by id rather than by the args object: the
+          // host may hand `execute` a copy of the args (see `intentsByCallId`).
+          resolveIntent: () => intentsByCallId.get(toolCallId),
           env: params.env,
           format: params.format,
           width: params.width,
@@ -561,15 +678,20 @@ export function definePwshTool(pi: ExtensionAPI) {
       // cwd have finished arriving. Marked as framed so the host adds neither
       // padding nor its state tint; the leading column is ours, like the
       // `Text(text, 1, 0)` those built-ins return.
+      // Resolved here, not inside `render`: the host calls this hook while the
+      // streamed args still carry `i`, and only paints the returned component
+      // later (often never, once a fast result replaces it) — a title computed
+      // lazily would miss its only chance to be remembered.
+      const label = callTitle(args);
       if (options.argsComplete !== true) {
         return markFramedBlockComponent({
-          render: () => [renderPendingRow(theme, callTitle(options, args))],
+          render: () => [renderPendingRow(theme, label)],
         });
       }
       return markFramedBlockComponent({
         render: (width: number) =>
           commandBlock(theme, width, args.command ?? "", {
-            label: callTitle(options, args),
+            label,
             cwd: args.cwd,
             closed: true,
             expanded: options.expanded === true,
@@ -586,10 +708,11 @@ export function definePwshTool(pi: ExtensionAPI) {
       if (!d) {
         // Partial/pending result (onUpdate fired, no details yet): args are
         // complete by now, so keep the command block visible.
+        const label = callTitle(args);
         return markFramedBlockComponent({
           render: (width: number) =>
             commandBlock(theme, width, args?.command ?? "", {
-              label: callTitle(options, args),
+              label,
               cwd: args?.cwd,
               closed: true,
               expanded: options.expanded === true,
@@ -600,11 +723,12 @@ export function definePwshTool(pi: ExtensionAPI) {
         ...d,
         timeoutSec: d.timeoutSec ?? normalizeTimeout(args?.timeout),
       };
+      const label = callTitle(args);
       return markFramedBlockComponent({
         render: (width: number) => {
           const effectiveCommand = args?.command || d.command || "";
           return renderCard(theme, width, effectiveCommand, displayDetails, {
-            label: callTitle(options, args),
+            label,
             // Only an explicit `cwd` reaches the title; the session cwd is implied.
             cwd: args?.cwd,
             expanded: options.expanded === true,

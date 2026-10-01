@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import { definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
@@ -21,6 +22,39 @@ const zStub = {
   record: schema,
   boolean: schema,
 };
+
+/** Params of the `tool_execution_start` event the tool subscribes to. */
+interface StartEventStub {
+  toolCallId: string;
+  args: unknown;
+  intent?: string;
+}
+
+/**
+ * Host stub exposing the registration surface `definePwshTool` touches at load:
+ * the schema builder and the event bus. `fireStart` replays
+ * `tool_execution_start` for `pwsh` with a live-ish context. The command
+ * registry is exercised in `pwsh-async.test.ts`.
+ */
+function makePi() {
+  const starts: Array<(event: unknown, ctx: unknown) => void> = [];
+  return {
+    zod: zStub,
+    on(event: string, handler: (event: unknown, ctx: unknown) => void) {
+      if (event === "tool_execution_start") starts.push(handler);
+    },
+    fireStart(event: StartEventStub) {
+      for (const handler of starts) {
+        handler(
+          { toolName: "pwsh", ...event },
+          // Interactive-host shape: a UI context is the only one allowed to own
+          // the footer slot (`pwsh-tool.ts` `refreshJobsStatus`).
+          { hasUI: true, ui: { setStatus() {} } },
+        );
+      }
+    },
+  };
+}
 
 const theme = {
   fg: (_color: string, text: string) => `\x1b[38;5;244m${text}\x1b[0m`,
@@ -891,12 +925,25 @@ test("renderResult titles the merged card with the intent and no cwd the call di
   expect(rendered).not.toContain(process.cwd());
 });
 
-test("keeps the streamed intent after the host strips it from the reconciled args", () => {
-  const tool = definePwshTool({ zod: zStub } as never);
-  // One render-state object per card, shared by renderCall and renderResult and
-  // mutated in place by the host. The merged card receives the args validated at
-  // execution start, which no longer carry `i` (intent tracing strips it), so the
-  // title has to come from what the streaming call already saw.
+/** Details of one finished foreground call, for merged-card title assertions. */
+const mergedDetails = {
+  cwd: "D:\\SessionCwd",
+  sessionKey: "D:\\SessionCwd\n",
+  format: "text" as const,
+  timeoutSec: 120,
+  wallTimeMs: 12,
+  exitCode: 0,
+  output: "ok\n",
+};
+
+test("keeps the intent after the host strips it from the reconciled args", () => {
+  const pi = makePi();
+  const tool = definePwshTool(pi as unknown as ExtensionAPI);
+  // The host hands each hook its own options object, never a shared one:
+  // `RegisteredToolAdapter` passes `renderCall` a fresh Proxy of the render
+  // state and `renderResult` a fresh `{expanded,isPartial,spinnerFrame}`
+  // literal. So the title has to key on the args object, and the intent of a
+  // `tool_execution_start` event is the only copy that outlives intent tracing.
   const options = { expanded: false, argsComplete: false };
   const streamed = tool
     .renderCall(
@@ -905,23 +952,19 @@ test("keeps the streamed intent after the host strips it from the reconciled arg
       theme,
     )
     .render(100);
-  options.argsComplete = true;
+
+  const reconciledArgs = { command: "Get-ChildItem" };
+  pi.fireStart({
+    toolCallId: "call_intent",
+    args: reconciledArgs,
+    intent: "List large files",
+  });
   const merged = tool
     .renderResult(
-      {
-        details: {
-          cwd: "D:\\SessionCwd",
-          sessionKey: "D:\\SessionCwd\n",
-          format: "text",
-          timeoutSec: 120,
-          wallTimeMs: 12,
-          exitCode: 0,
-          output: "ok\n",
-        },
-      },
-      options,
+      { details: mergedDetails },
+      { expanded: false, isPartial: false },
       theme,
-      { command: "Get-ChildItem" },
+      reconciledArgs,
     )
     .render(100)
     .join("\n");
@@ -929,6 +972,64 @@ test("keeps the streamed intent after the host strips it from the reconciled arg
   expect(streamed.join("\n")).toContain("List large files");
   expect(merged).toContain("List large files");
   expect(merged).not.toContain("PowerShell 7");
+});
+
+test("titles a card the streamed call never saw, from the execution-start intent", () => {
+  const pi = makePi();
+  const tool = definePwshTool(pi as unknown as ExtensionAPI);
+  // A fast model can finish the call before the host paints anything, so the
+  // card is created at `tool_execution_start` with args that no longer carry
+  // `i`. The intent then exists only on that event.
+  const args = { command: "Get-ChildItem -Recurse" };
+  pi.fireStart({
+    toolCallId: "call_fast",
+    args,
+    intent: "List every file",
+  });
+  const merged = tool
+    .renderResult(
+      { details: mergedDetails },
+      { expanded: false },
+      theme,
+      args,
+    )
+    .render(100)
+    .join("\n");
+
+  expect(merged).toContain("List every file");
+  expect(merged).not.toContain("PowerShell 7");
+});
+
+test("flattens a host-recorded intent so it cannot split the card row", () => {
+  const pi = makePi();
+  const tool = definePwshTool(pi as unknown as ExtensionAPI);
+  const args = { command: "Get-ChildItem" };
+  pi.fireStart({
+    toolCallId: "call_multiline",
+    args,
+    intent: "List\u001b[31m\nlarge files",
+  });
+  const rows = tool
+    .renderResult({ details: mergedDetails }, { expanded: false }, theme, args)
+    .render(60);
+
+  expect(rows.filter((row) => row.includes("\n"))).toEqual([]);
+  expect(rows.join("\n")).toContain("List large files");
+});
+
+test("falls back to the tool label when no intent was ever declared or recorded", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const merged = tool
+    .renderResult(
+      { details: mergedDetails },
+      { expanded: false },
+      theme,
+      { command: "Get-ChildItem" },
+    )
+    .render(100)
+    .join("\n");
+
+  expect(merged).toContain("PowerShell 7");
 });
 
 test("the completed command frame is marked as a framed block", () => {

@@ -41,6 +41,12 @@ const theme = {
 
 type SentMessage = { message: unknown; options: unknown };
 
+/** Every footer/notification call the tool made through its UI context. */
+interface UiRecorder {
+  statuses: Array<[key: string, text: string | undefined]>;
+  notices: string[];
+}
+
 /**
  * The tool bound to a host stub that records every `sendMessage` aside. Tests
  * assert both directions: the completion notice that fires on its own, and the
@@ -49,10 +55,38 @@ type SentMessage = { message: unknown; options: unknown };
  */
 function makeTool() {
   const sentMessages: SentMessage[] = [];
+  const starts: Array<(event: unknown, ctx: unknown) => void> = [];
+  const commands = new Map<
+    string,
+    { handler: (args: string, ctx: unknown) => Promise<void> }
+  >();
+  const ui: UiRecorder = { statuses: [], notices: [] };
+  // One context object, like the host's session-scoped UI context. `hasUI` is
+  // what the extension checks before letting a context own the footer slot.
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setStatus(key: string, text: string | undefined) {
+        ui.statuses.push([key, text]);
+      },
+      notify(message: string) {
+        ui.notices.push(message);
+      },
+    },
+  };
   const pi = {
     zod: zStub,
     sendMessage(message: unknown, options: unknown) {
       sentMessages.push({ message, options });
+    },
+    on(event: string, handler: (event: unknown, ctx: unknown) => void) {
+      if (event === "tool_execution_start") starts.push(handler);
+    },
+    registerCommand(
+      name: string,
+      options: { handler: (args: string, ctx: unknown) => Promise<void> },
+    ) {
+      commands.set(name, options);
     },
   } as unknown as ExtensionAPI;
   const tool = definePwshTool(pi);
@@ -70,7 +104,20 @@ function makeTool() {
     expect(jobId).not.toBe("");
     return { jobId, res };
   };
-  return { tool, sentMessages, startJob };
+  /**
+   * Replay `tool_execution_start` for pwsh, as the host loop emits it. `from`
+   * overrides the context (a subagent session reports `hasUI: false`).
+   */
+  const fireStart = (event: {
+    toolCallId: string;
+    args: unknown;
+    intent?: string;
+  }, from: unknown = ctx) => {
+    for (const handler of starts) {
+      handler({ toolName: "pwsh", ...event }, from);
+    }
+  };
+  return { tool, sentMessages, startJob, fireStart, commands, ctx, ui };
 }
 
 /** Text body of a recorded aside, or "" when it is not a text message. */
@@ -125,9 +172,14 @@ test("starts an async job immediately without blocking and delivers result via s
     const msg = rawMsg as {
       customType: string;
       content: string;
+      display?: boolean;
       details: { jobId: string; type: string; label?: string };
     };
     expect(msg.customType).toBe("async-result");
+    // The host paints an `async-result` message only when `display` is set
+    // (`ui-helpers.ts`: `if (message.display)`), so a delivery without it
+    // reached the model but left the transcript empty.
+    expect(msg.display).toBe(true);
     expect(msg.content).toContain("async finished");
     expect(msg.details.jobId).toBe(jobId);
     expect(msg.details.type).toBe("pwsh");
@@ -794,4 +846,92 @@ test("an async job that calls exit 0 still reports success", async () => {
   expect(waitRes.details.status).toBe("completed");
   expect(waitRes.isError).toBeFalsy();
   expect(waitRes.content[0]?.text).toContain("zero-ok");
+});
+
+test("publishes the pwsh job count in the footer and clears it when the pool drains", async () => {
+  const { startJob, fireStart, ui } = makeTool();
+  // Drop anything an earlier test left running so the count is exact.
+  getJobManager().disposeAll();
+
+  const { jobId } = await startJob("call_footer_count", {
+    command: "Start-Sleep -Milliseconds 400",
+  });
+  // The host loop does not await the event consumer before `tool.execute`, so
+  // the start event arrives with the job already registered.
+  fireStart({
+    toolCallId: "call_footer_count",
+    args: { command: "Start-Sleep -Milliseconds 400", async: true },
+    intent: "Sleeping briefly",
+  });
+
+  expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", "pwsh 1 running"]);
+
+  await getJobManager().getJob(jobId)?.settled;
+  expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", undefined]);
+});
+
+test("registers /pwsh and lists running jobs with their intent", async () => {
+  const { startJob, commands, ctx, ui } = makeTool();
+  getJobManager().disposeAll();
+
+  const { jobId } = await startJob("call_job_list", {
+    command: "Start-Sleep -Milliseconds 400",
+    i: "Sleeping briefly",
+  });
+  const command = commands.get("pwsh");
+  expect(command).toBeDefined();
+
+  await command!.handler("", ctx);
+  const report = ui.notices.at(-1) ?? "";
+  expect(report).toContain("1 running");
+  expect(report).toContain(jobId);
+  expect(report).toContain("Sleeping briefly");
+
+  await getJobManager().getJob(jobId)?.settled;
+});
+
+test("labels a listed job from the intent recorded on tool_execution_start", async () => {
+  const { tool, fireStart, commands, ctx, ui } = makeTool();
+  getJobManager().disposeAll();
+
+  // `i` is stripped from the parameters before `execute` runs under intent
+  // tracing, so the label can only come from what the start event recorded —
+  // and it has to be read by *call id*: the host may hand `execute` a rebuilt
+  // copy of the args (`transformToolCallArguments`, `deobfuscateToolArguments`),
+  // modelled here by two distinct objects under one id.
+  const executeArgs = { command: "Start-Sleep -Milliseconds 300", async: true };
+  const res = await tool.execute("call_late_intent", executeArgs, undefined, undefined);
+  const jobId = res.details.jobId ?? "";
+  fireStart({
+    toolCallId: "call_late_intent",
+    args: { ...executeArgs },
+    intent: "Sleeping late",
+  });
+  await getJobManager().getJob(jobId)?.settled;
+
+  await commands.get("pwsh")!.handler("", ctx);
+  const report = ui.notices.at(-1) ?? "";
+  expect(report).toContain(jobId);
+  expect(report).toContain("Sleeping late");
+});
+
+test("a subagent context cannot hijack the footer slot from the interactive session", async () => {
+  const { startJob, fireStart, ui } = makeTool();
+  getJobManager().disposeAll();
+
+  const { jobId } = await startJob("call_parent", {
+    command: "Start-Sleep -Milliseconds 300",
+  });
+  fireStart({ toolCallId: "call_parent", args: { async: true }, intent: "Parent job" });
+  expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", "pwsh 1 running"]);
+
+  // A subagent session re-binds this module's factories and reports
+  // `hasUI: false` against a no-op UI. If it owned the slot, the settling job's
+  // reset would land there and the interactive footer would keep the stale
+  // count. The list must stay untouched.
+  const noUiCtx = { hasUI: false, ui: { setStatus: () => {} } };
+  fireStart({ toolCallId: "call_child", args: { async: true }, intent: "Child job" }, noUiCtx);
+
+  await getJobManager().getJob(jobId)?.settled;
+  expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", undefined]);
 });

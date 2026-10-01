@@ -40,6 +40,13 @@ export interface PwshJob {
   outputTruncated?: boolean;
   error?: string | null;
   intent?: string;
+  /**
+   * Late intent lookup. `i` is stripped from the tool's parameters before
+   * `execute` runs (intent tracing), so the label is only known once the
+   * `tool_execution_start` hook has recorded it for that call id — by delivery
+   * time, always.
+   */
+  readonly resolveIntent?: () => string | undefined;
   readonly abortController: AbortController;
   readonly settled: Promise<PwshJob>;
 }
@@ -50,10 +57,69 @@ export interface StartJobOptions {
   command: string;
   cwd: string;
   intent?: string;
+  resolveIntent?: () => string | undefined;
   env?: Record<string, string>;
   format?: "text" | "json";
   width?: number;
   timeoutSec?: number;
+}
+
+/** Marker per job status, matching the card's status language (`card.ts`). */
+const JOB_MARKERS: Record<PwshJobStatus, string> = {
+  running: "●",
+  completed: "✓",
+  failed: "✗",
+  killed: "◼",
+};
+
+/** Settled jobs listed by {@link jobsReport}. */
+const RECENT_JOB_ROWS = 5;
+
+/** Label budget in the listing, so one long command cannot flood the notice. */
+const JOB_LABEL_CHARS = 60;
+
+/** Whole/partial seconds, the same granularity the job card shows. */
+function formatJobDuration(ms: number): string {
+  return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+}
+
+/** Display label for one job: the declared intent, else its first command line. */
+function jobLabel(job: PwshJob): string {
+  const declared = job.intent?.trim() || job.resolveIntent?.()?.trim();
+  if (declared) return declared;
+  return job.command.split("\n", 1)[0]?.trim() || job.id;
+}
+
+/** One listing row: marker, id, status, elapsed time, clamped label. */
+function jobRow(job: PwshJob, now: number): string {
+  const label = jobLabel(job).replace(/\s+/g, " ");
+  const shown =
+    label.length > JOB_LABEL_CHARS
+      ? `${label.slice(0, JOB_LABEL_CHARS - 3)}...`
+      : label;
+  const elapsed = (job.endTime ?? now) - job.startTime;
+  return `  ${JOB_MARKERS[job.status]} ${job.id} ${job.status} ${formatJobDuration(elapsed)} — ${shown}`;
+}
+
+/**
+ * `/pwsh` listing: running jobs first, then the most recently settled ones.
+ * One row per job — marker, id, elapsed time, label.
+ */
+export function jobsReport(
+  jobs: readonly PwshJob[],
+  now = Date.now(),
+): string {
+  if (jobs.length === 0) {
+    return 'No PowerShell background jobs. Start one with pwsh { command: "…", async: true }.';
+  }
+  const running = jobs.filter((job) => job.status === "running");
+  const settled = jobs
+    .filter((job) => job.status !== "running")
+    .sort((a, b) => (b.endTime ?? 0) - (a.endTime ?? 0))
+    .slice(0, RECENT_JOB_ROWS);
+  const lines = [`PowerShell jobs — ${running.length} running`];
+  for (const job of [...running, ...settled]) lines.push(jobRow(job, now));
+  return lines.join("\n");
 }
 
 export class PwshJobManager {
@@ -62,6 +128,7 @@ export class PwshJobManager {
   readonly #waiters = new WeakMap<PwshJob, number>();
   readonly #pool: PwshSessionPool;
   #pi?: ExtensionAPI;
+  #jobsChanged?: () => void;
 
   constructor(pool: PwshSessionPool, pi?: ExtensionAPI) {
     this.#pool = pool;
@@ -70,6 +137,15 @@ export class PwshJobManager {
 
   setExtensionApi(pi: ExtensionAPI): void {
     this.#pi = pi;
+  }
+
+  /**
+   * Notified whenever the retained job set or a job's status changes — the
+   * footer count and the `/pwsh` listing read the pool on demand, so they only
+   * need a nudge to refresh.
+   */
+  setJobsChangedListener(listener: (() => void) | undefined): void {
+    this.#jobsChanged = listener;
   }
 
   generateJobId(): string {
@@ -111,11 +187,13 @@ export class PwshJobManager {
       status: "running",
       output: "",
       intent: options.intent,
+      resolveIntent: options.resolveIntent,
       abortController,
       settled,
     };
 
     this.#jobs.set(id, job);
+    this.#jobsChanged?.();
 
     // Launch worker execution asynchronously in the background
     void (async () => {
@@ -191,6 +269,7 @@ export class PwshJobManager {
           this.#deliverCompletion(job);
         }
         this.#pruneSettledJobs();
+        this.#jobsChanged?.();
       }
     })();
 
@@ -227,6 +306,7 @@ export class PwshJobManager {
       job.abortController.abort();
       this.#pool.dispose(job.sessionKey);
       job.endTime = Date.now();
+      this.#jobsChanged?.();
     }
     return job;
   }
@@ -287,16 +367,13 @@ export class PwshJobManager {
       }
     }
     this.#jobs.clear();
+    this.#jobsChanged?.();
   }
 
   #deliverCompletion(job: PwshJob): void {
     const durationMs = (job.endTime ?? Date.now()) - job.startTime;
     const durationSec = (durationMs / 1000).toFixed(1);
-    const rawLabel =
-      job.intent && job.intent.trim().length > 0
-        ? job.intent
-        : job.command;
-    const cleanLabel = rawLabel.replace(/\s+/g, " ").trim();
+    const cleanLabel = jobLabel(job).replace(/\s+/g, " ").trim();
     const label =
       cleanLabel.length > 40 ? `${cleanLabel.slice(0, 37)}...` : cleanLabel;
 
@@ -323,6 +400,12 @@ export class PwshJobManager {
         {
           customType: "async-result",
           content: summaryLines.join("\n"),
+          // `display: false` is the payload default, and the host paints an
+          // `async-result` message only when it is set (`ui-helpers.ts`:
+          // `if (message.display)`), so without it the completion reached the
+          // model but never the transcript. `display: true` reuses the host's
+          // native "Background job completed" card.
+          display: true,
           details: {
             jobId: job.id,
             type: "pwsh",
