@@ -7,10 +7,10 @@
  * to wake the model without polling.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import type { PwshSessionPool } from "./session";
+import type { PwshRunResult, PwshSessionPool } from "./session";
 
 /** Maximum output characters retained in-memory per background job (1 MB tail window). */
-const MAX_JOB_OUTPUT_CHARS = 1024 * 1024;
+export const MAX_JOB_OUTPUT_CHARS = 1024 * 1024;
 
 /** Maximum output characters included in the async completion message sent to the agent prompt (16 KB). */
 const MAX_DELIVERY_OUTPUT_CHARS = 16 * 1024;
@@ -22,12 +22,13 @@ const MAX_DELIVERY_OUTPUT_CHARS = 16 * 1024;
  */
 export const MAX_RETAINED_SETTLED_JOBS = 32;
 
-const DEFAULT_TIMEOUT_SEC = 120;
+export const DEFAULT_TIMEOUT_SEC = 120;
 
 export type PwshJobStatus = "running" | "completed" | "failed" | "killed";
 
 export interface PwshJob {
-  readonly id: string;
+  /** Assigned by the runtime that starts the job (host job id when host-backed). */
+  id: string;
   readonly command: string;
   readonly sessionKey: string;
   readonly cwd: string;
@@ -52,6 +53,159 @@ export interface PwshJob {
 }
 
 export type PwshWaitOutcome = "settled" | "timeout" | "aborted";
+
+/**
+ * Background-job surface the pwsh tool drives, implemented twice: the private
+ * {@link PwshJobManager} (stock omp) and {@link HostPwshJobs} (omp's scoped
+ * async-job manager, when the session exposes one). The tool and the renderers
+ * only ever see {@link PwshJob} records, so both runtimes report the same way.
+ */
+export interface PwshJobsRuntime {
+  /**
+   * Who delivers a settled job's result: `"self"` — this runtime posts the
+   * `async-result` aside and a wait that consumed the result suppresses it;
+   * `"host"` — the host manager owns delivery, so a wait reports state only.
+   */
+  readonly resultDelivery: "self" | "host";
+  setJobsChangedListener(listener: (() => void) | undefined): void;
+  listJobs(): readonly PwshJob[];
+  getJob(id: string): PwshJob | undefined;
+  startJob(options: StartJobOptions): PwshJob;
+  killJob(id: string): PwshJob | undefined;
+  waitJob(
+    id: string,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<{ job: PwshJob; outcome: PwshWaitOutcome } | undefined>;
+  disposeAll(): void;
+}
+
+/**
+ * Fold a finished session run into the job record: status, exit code, output
+ * fallback, error. Shared by both runtimes, so a job's outcome does not depend
+ * on which one is running it.
+ */
+export function finishPwshJob(
+  job: PwshJob,
+  res: PwshRunResult,
+  aborted: boolean,
+): void {
+  if (aborted || job.status === "killed") {
+    job.status = "killed";
+    if (!job.output && res.partialOutput) job.output = res.partialOutput;
+    return;
+  }
+  if (res.timedOut) {
+    job.status = "failed";
+    job.error = "Command timed out.";
+    if (!job.output && res.partialOutput) job.output = res.partialOutput;
+    return;
+  }
+  if (res.dead || res.error) {
+    job.status = "failed";
+    job.error = res.error ?? "Subprocess failed.";
+    if (!job.output && res.partialOutput) job.output = res.partialOutput;
+    return;
+  }
+  const resp = res.response;
+  job.exitCode = resp?.exitCode;
+  if (resp?.output && !job.output) {
+    if (resp.output.length > MAX_JOB_OUTPUT_CHARS) {
+      job.output = resp.output.slice(-MAX_JOB_OUTPUT_CHARS);
+      job.outputTruncated = true;
+    } else {
+      job.output = resp.output;
+    }
+  }
+  if (resp?.error) job.error = resp.error;
+  const hasError = Boolean(
+    job.error || (job.exitCode != null && job.exitCode !== 0),
+  );
+  job.status = hasError ? "failed" : "completed";
+}
+
+/** Append streamed output to a job, keeping the retained tail window bounded. */
+export function appendPwshJobOutput(job: PwshJob, chunk: string): void {
+  if (job.output.length + chunk.length > MAX_JOB_OUTPUT_CHARS) {
+    job.output = (job.output + chunk).slice(-MAX_JOB_OUTPUT_CHARS);
+    job.outputTruncated = true;
+  } else {
+    job.output += chunk;
+  }
+}
+
+/**
+ * Run one background job in its own pooled session and fold the outcome into
+ * its record. Both runtimes call this, so a job's terminal state (killed,
+ * timed out, failed, completed) does not depend on which one started it.
+ *
+ * Never rejects: a thrown run is recorded as the job's failure. Callers that
+ * only await settlement, and host bodies that must report the final state to
+ * their own manager, can therefore always rely on the record being final.
+ */
+export async function runPwshJob(
+  job: PwshJob,
+  pool: PwshSessionPool,
+  options: StartJobOptions,
+  signal: AbortSignal,
+  onChunk?: (chunk: string, job: PwshJob) => void,
+): Promise<void> {
+  try {
+    const session = pool.getOrCreate(job.sessionKey, options.cwd);
+    const res = await session.run(
+      {
+        code: options.command,
+        env: options.env,
+        width: options.width,
+        format: options.format,
+      },
+      {
+        timeoutMs: job.timeoutSec > 0 ? job.timeoutSec * 1000 : undefined,
+        signal,
+        onChunk: (chunk) => {
+          appendPwshJobOutput(job, chunk);
+          onChunk?.(chunk, job);
+        },
+      },
+    );
+    finishPwshJob(job, res, signal.aborted);
+  } catch (err) {
+    if (job.status !== "killed") {
+      job.status = "failed";
+      job.error = err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    job.endTime = Date.now();
+    pool.dispose(job.sessionKey);
+  }
+}
+
+/**
+ * Drop the oldest settled jobs once more than {@link MAX_RETAINED_SETTLED_JOBS}
+ * are retained, newest by settle time first — each record keeps up to
+ * {@link MAX_JOB_OUTPUT_CHARS} of output, so an unbounded map is a leak.
+ * Running jobs stay; `keep` protects a record a runtime still needs (the
+ * private manager holds jobs with a waiter blocked on them, since that waiter
+ * must be able to return the handle).
+ */
+export function pruneSettledJobs(
+  jobs: Map<string, PwshJob>,
+  keep: (job: PwshJob) => boolean,
+): void {
+  const settled: PwshJob[] = [];
+  for (const job of jobs.values()) {
+    if (job.status === "running" || keep(job)) continue;
+    settled.push(job);
+  }
+  if (settled.length <= MAX_RETAINED_SETTLED_JOBS) return;
+  settled.sort((a, b) => (a.endTime ?? 0) - (b.endTime ?? 0));
+  for (const job of settled.slice(
+    0,
+    settled.length - MAX_RETAINED_SETTLED_JOBS,
+  )) {
+    jobs.delete(job.id);
+  }
+}
 
 export interface StartJobOptions {
   command: string;
@@ -84,10 +238,41 @@ function formatJobDuration(ms: number): string {
 }
 
 /** Display label for one job: the declared intent, else its first command line. */
-function jobLabel(job: PwshJob): string {
+export function jobLabel(job: PwshJob): string {
   const declared = job.intent?.trim() || job.resolveIntent?.()?.trim();
   if (declared) return declared;
   return job.command.split("\n", 1)[0]?.trim() || job.id;
+}
+
+/**
+ * Completion text for one settled job: status, duration, exit code, output,
+ * error. `maxChars` caps the inlined output — the private manager passes its
+ * prompt cap; host-backed delivery passes none and lets the host spill an
+ * oversized payload to an artifact.
+ */
+export function jobResultText(job: PwshJob, maxChars?: number): string {
+  const durationSec = (
+    ((job.endTime ?? Date.now()) - job.startTime) /
+    1000
+  ).toFixed(1);
+  const trimmedOutput = job.output.trim();
+  let outputSection: string | undefined;
+  if (trimmedOutput.length > 0) {
+    if (maxChars != null && trimmedOutput.length > maxChars) {
+      const tail = trimmedOutput.slice(-maxChars);
+      outputSection = `Output (last ${maxChars} chars):\n${tail}\n... [output truncated (${trimmedOutput.length} chars total); inspect with { jobId: "${job.id}" }]`;
+    } else {
+      outputSection = `Output:\n${trimmedOutput}`;
+    }
+  }
+  return [
+    `PowerShell background job '${job.id}' ${job.status} (${durationSec}s).`,
+    job.exitCode != null ? `Exit code: ${job.exitCode}` : undefined,
+    outputSection,
+    job.error?.trim() ? `Error:\n${job.error.trim()}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /** One listing row: marker, id, status, elapsed time, clamped label. */
@@ -122,7 +307,8 @@ export function jobsReport(
   return lines.join("\n");
 }
 
-export class PwshJobManager {
+export class PwshJobManager implements PwshJobsRuntime {
+  readonly resultDelivery = "self" as const;
   readonly #jobs = new Map<string, PwshJob>();
   /** Jobs with a waiter blocked in `waitJob`; any entry suppresses that job's completion aside. */
   readonly #waiters = new WeakMap<PwshJob, number>();
@@ -196,106 +382,24 @@ export class PwshJobManager {
     this.#jobsChanged?.();
 
     // Launch worker execution asynchronously in the background
-    void (async () => {
-      const session = this.#pool.getOrCreate(sessionKey, options.cwd);
-      try {
-        const res = await session.run(
-          {
-            code: options.command,
-            env: options.env,
-            width: options.width,
-            format: options.format,
-          },
-          {
-            timeoutMs: timeoutSec > 0 ? timeoutSec * 1000 : undefined,
-            signal: abortController.signal,
-            onChunk: (chunk) => {
-              if (job.output.length + chunk.length > MAX_JOB_OUTPUT_CHARS) {
-                job.output = (job.output + chunk).slice(-MAX_JOB_OUTPUT_CHARS);
-                job.outputTruncated = true;
-              } else {
-                job.output += chunk;
-              }
-            },
-          },
-        );
-
-        if (abortController.signal.aborted || job.status === "killed") {
-          job.status = "killed";
-          if (!job.output && res.partialOutput) {
-            job.output = res.partialOutput;
-          }
-        } else if (res.timedOut) {
-          job.status = "failed";
-          job.error = "Command timed out.";
-          if (!job.output && res.partialOutput) {
-            job.output = res.partialOutput;
-          }
-        } else if (res.dead || res.error) {
-          job.status = "failed";
-          job.error = res.error ?? "Subprocess failed.";
-          if (!job.output && res.partialOutput) {
-            job.output = res.partialOutput;
-          }
-        } else {
-          const resp = res.response;
-          job.exitCode = resp?.exitCode;
-          if (resp?.output && !job.output) {
-            if (resp.output.length > MAX_JOB_OUTPUT_CHARS) {
-              job.output = resp.output.slice(-MAX_JOB_OUTPUT_CHARS);
-              job.outputTruncated = true;
-            } else {
-              job.output = resp.output;
-            }
-          }
-          if (resp?.error) {
-            job.error = resp.error;
-          }
-          const hasError = Boolean(job.error || (job.exitCode != null && job.exitCode !== 0));
-          job.status = hasError ? "failed" : "completed";
-        }
-      } catch (err) {
-        if (job.status !== "killed") {
-          job.status = "failed";
-          job.error = err instanceof Error ? err.message : String(err);
-        }
-      } finally {
-        job.endTime = Date.now();
-        this.#pool.dispose(job.sessionKey);
+    void runPwshJob(job, this.#pool, options, abortController.signal).then(
+      () => {
         resolveSettled(job);
 
         // Auto-deliver completion notice via pi.sendMessage if available and not killed manually
-        if (job.status !== "killed" && !this.#waiters.has(job) && this.#pi?.sendMessage) {
+        if (
+          job.status !== "killed" &&
+          !this.#waiters.has(job) &&
+          this.#pi?.sendMessage
+        ) {
           this.#deliverCompletion(job);
         }
-        this.#pruneSettledJobs();
+        pruneSettledJobs(this.#jobs, (settled) => this.#waiters.has(settled));
         this.#jobsChanged?.();
-      }
-    })();
+      },
+    );
 
     return job;
-  }
-
-  /**
-   * Drop the oldest settled jobs once more than {@link MAX_RETAINED_SETTLED_JOBS}
-   * are retained, newest by settle time first. Running jobs and jobs with a
-   * waiter attached stay: the waiter already holds the handle and must be able
-   * to return it, and a wait that outlives its job still has to find it.
-   */
-  #pruneSettledJobs(): void {
-    const settled: PwshJob[] = [];
-    for (const job of this.#jobs.values()) {
-      if (job.status === "running" || this.#waiters.has(job)) continue;
-      settled.push(job);
-    }
-    if (settled.length <= MAX_RETAINED_SETTLED_JOBS) return;
-    settled.sort((a, b) => (a.endTime ?? 0) - (b.endTime ?? 0));
-    for (const job of settled.slice(
-      0,
-      settled.length - MAX_RETAINED_SETTLED_JOBS,
-    )) {
-      this.#jobs.delete(job.id);
-    }
   }
 
   killJob(id: string): PwshJob | undefined {
@@ -372,34 +476,15 @@ export class PwshJobManager {
 
   #deliverCompletion(job: PwshJob): void {
     const durationMs = (job.endTime ?? Date.now()) - job.startTime;
-    const durationSec = (durationMs / 1000).toFixed(1);
     const cleanLabel = jobLabel(job).replace(/\s+/g, " ").trim();
     const label =
       cleanLabel.length > 40 ? `${cleanLabel.slice(0, 37)}...` : cleanLabel;
-
-    let outputSection: string | undefined;
-    const trimmedOutput = job.output.trim();
-    if (trimmedOutput.length > 0) {
-      if (trimmedOutput.length > MAX_DELIVERY_OUTPUT_CHARS) {
-        const tail = trimmedOutput.slice(-MAX_DELIVERY_OUTPUT_CHARS);
-        outputSection = `Output (last ${MAX_DELIVERY_OUTPUT_CHARS} chars):\n${tail}\n... [output truncated (${trimmedOutput.length} chars total); inspect with { jobId: "${job.id}" }]`;
-      } else {
-        outputSection = `Output:\n${trimmedOutput}`;
-      }
-    }
-
-    const summaryLines = [
-      `PowerShell background job '${job.id}' ${job.status} (${durationSec}s).`,
-      job.exitCode != null ? `Exit code: ${job.exitCode}` : undefined,
-      outputSection,
-      job.error?.trim() ? `Error:\n${job.error.trim()}` : undefined,
-    ].filter(Boolean);
 
     try {
       this.#pi?.sendMessage(
         {
           customType: "async-result",
-          content: summaryLines.join("\n"),
+          content: jobResultText(job, MAX_DELIVERY_OUTPUT_CHARS),
           // `display: false` is the payload default, and the host paints an
           // `async-result` message only when it is set (`ui-helpers.ts`:
           // `if (message.display)`), so without it the completion reached the

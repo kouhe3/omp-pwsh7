@@ -29,11 +29,13 @@ import {
   type Theme,
 } from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
+import { HostPwshJobs, hostAsyncJobs } from "./host-jobs";
 import {
   PwshJobManager,
   jobsReport,
   type PwshJob,
   type PwshJobStatus,
+  type PwshJobsRuntime,
 } from "./job";
 
 const DEFAULT_TIMEOUT_SEC = 120;
@@ -333,6 +335,22 @@ function jobSnapshotText(job: PwshJob): string {
     .join("\n");
 }
 
+/**
+ * A settled host-backed job: the host delivers its result on its own, so the
+ * wait reports the outcome and points at that delivery instead of repeating the
+ * payload into the transcript.
+ */
+function hostWaitText(job: PwshJob): string {
+  const elapsedSec = (
+    ((job.endTime ?? Date.now()) - job.startTime) /
+    1000
+  ).toFixed(1);
+  return [
+    `Job '${job.id}' ${job.status} in ${elapsedSec}s.`,
+    `Its output is delivered as a background result; re-read it with { jobId: "${job.id}" } if it is not in context.`,
+  ].join("\n");
+}
+
 function normalizeWidth(value: number | undefined): number {
   if (value === undefined) return DEFAULT_WIDTH;
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(value)));
@@ -419,7 +437,8 @@ function refreshJobsStatus(ctx?: ExtensionContext): void {
   const ui = jobsStatusCtx?.ui;
   if (!ui) return;
   const running =
-    jobManager?.listJobs().filter((job) => job.status === "running").length ?? 0;
+    jobsRuntime?.listJobs().filter((job) => job.status === "running").length ??
+    0;
   ui.setStatus(
     JOBS_STATUS_KEY,
     running > 0 ? `pwsh ${running} running` : undefined,
@@ -436,8 +455,12 @@ function refreshJobsStatus(ctx?: ExtensionContext): void {
  * The `typeof` guards keep the test stubs working: `definePwshTool` is also
  * called with a schema-only host object, where neither bus exists.
  */
-function installJobsUi(pi: ExtensionAPI, jobs: PwshJobManager): void {
-  jobs.setJobsChangedListener(() => refreshJobsStatus());
+function installJobsUi(pi: ExtensionAPI): void {
+  // The listener outlives the runtime it was installed on: `refreshJobsStatus`
+  // reads whatever runtime is current, so a later host-backed swap keeps the
+  // footer live.
+  jobsChangedListener = () => refreshJobsStatus();
+  jobsRuntime?.setJobsChangedListener(jobsChangedListener);
   if (typeof pi.on === "function") {
     pi.on(
       "tool_execution_start",
@@ -457,7 +480,10 @@ function installJobsUi(pi: ExtensionAPI, jobs: PwshJobManager): void {
       description: "List PowerShell background jobs",
       handler: async (_args: string, ctx: ExtensionContext) => {
         refreshJobsStatus(ctx);
-        ctx.ui.notify(jobsReport(jobs.listJobs()), "info");
+        ctx.ui.notify(
+          jobsReport(getJobManager(undefined, ctx).listJobs()),
+          "info",
+        );
       },
     });
   }
@@ -465,7 +491,7 @@ function installJobsUi(pi: ExtensionAPI, jobs: PwshJobManager): void {
 
 export function definePwshTool(pi: ExtensionAPI) {
   // Ensure the background job manager is initialized and bound to the host ExtensionAPI.
-  installJobsUi(pi, getJobManager(pi));
+  installJobsUi(pi);
   const z = pi.zod;
   return {
     name: "pwsh",
@@ -544,9 +570,10 @@ export function definePwshTool(pi: ExtensionAPI) {
       onUpdate:
         | ((update: { content: Array<{ type: "text"; text: string }> }) => void)
         | undefined,
+      ctx?: ExtensionContext,
     ): Promise<PwshToolResult> {
       const pool = getPool();
-      const jm = getJobManager(pi);
+      const jm = getJobManager(pi, ctx);
       const cwd = params.cwd ?? process.cwd();
 
       if (params.action && !params.jobId) {
@@ -604,6 +631,17 @@ export function definePwshTool(pi: ExtensionAPI) {
               .filter(Boolean)
               .join("\n");
             return toolText(text, jobDetails(pendingJob, params, cwd, ""));
+          }
+          if (waited && jm.resultDelivery === "host") {
+            // The host manager owns delivery for these jobs: it posts the
+            // result (and wakes the model) the moment the job settles, so a
+            // settled wait reports the outcome and where the payload goes
+            // instead of inlining the same output twice.
+            return toolText(
+              hostWaitText(waited.job),
+              jobDetails(waited.job, params, cwd),
+              waited.job.status === "failed",
+            );
           }
         }
 
@@ -663,11 +701,11 @@ export function definePwshTool(pi: ExtensionAPI) {
       const out = await runPwsh(params, pool, onUpdate, signal);
       return toolText(out.text, out.details, out.isError);
     },
-    onSession(event: { reason: string }): void {
+    onSession(event: { reason: string }, ctx?: ExtensionContext): void {
       // Session lifecycle cleanup: kill pwsh subprocesses on shutdown so no
       // orphan processes survive the omp session.
       if (event.reason === "shutdown") {
-        getJobManager().disposeAll();
+        getJobManager(undefined, ctx).disposeAll();
         getPool().disposeAll();
       }
     },
@@ -749,20 +787,67 @@ function getPool(): PwshSessionPool {
   return pool;
 }
 
-let jobManager: PwshJobManager | null = null;
+/**
+ * The subset of the host context runtime selection reads. Declared structurally
+ * because `asyncJobs` exists only on patched omp — the published
+ * `ExtensionContext` this extension compiles against has no such field, and a
+ * stock session never sets it.
+ */
+export type JobsRuntimeContext = ExtensionContext | { asyncJobs?: unknown };
 
-export function getJobManager(pi?: ExtensionAPI): PwshJobManager {
-  if (!jobManager) {
-    jobManager = new PwshJobManager(getPool(), pi);
-  } else if (pi) {
-    jobManager.setExtensionApi(pi);
+/** The background-job runtime in use, created from the first context that has one. */
+let jobsRuntime: PwshJobsRuntime | null = null;
+/** Footer refresh callback, kept across a runtime swap (see `installJobsUi`). */
+let jobsChangedListener: (() => void) | undefined;
+let jobsPi: ExtensionAPI | undefined;
+
+/**
+ * Pick the job runtime from the session's capabilities, and return it.
+ *
+ * With omp's scoped async-job surface (`ctx.asyncJobs`) pwsh jobs are first
+ * class: a jobs-sheet row with the live pid and progress, the session's
+ * running-job cap, cancellation from either side, and host-owned completion
+ * delivery. Stock omp exposes no such surface, so the private
+ * {@link PwshJobManager} keeps the feature working there.
+ *
+ * The choice is made on the first call carrying a context — starting a job
+ * requires one — and the local runtime is only replaced while it holds no jobs,
+ * so an upgrade can never orphan a record.
+ */
+export function getJobManager(
+  pi?: ExtensionAPI,
+  ctx?: JobsRuntimeContext,
+): PwshJobsRuntime {
+  if (pi) jobsPi = pi;
+  const host = hostAsyncJobs(ctx);
+  if (!jobsRuntime) {
+    jobsRuntime = createJobsRuntime(host);
+  } else if (
+    host &&
+    jobsRuntime.resultDelivery === "self" &&
+    jobsRuntime.listJobs().length === 0
+  ) {
+    jobsRuntime = createJobsRuntime(host);
   }
-  return jobManager;
+  // The private manager delivers its own asides, so it needs the API handle;
+  // a runtime created before `definePwshTool` ran must still be injected.
+  if (pi && jobsRuntime instanceof PwshJobManager) {
+    jobsRuntime.setExtensionApi(pi);
+  }
+  return jobsRuntime;
+}
+
+function createJobsRuntime(
+  host: ReturnType<typeof hostAsyncJobs>,
+): PwshJobsRuntime {
+  const runtime: PwshJobsRuntime = host
+    ? new HostPwshJobs(host, getPool())
+    : new PwshJobManager(getPool(), jobsPi);
+  runtime.setJobsChangedListener(jobsChangedListener);
+  return runtime;
 }
 
 export function resetJobManager(): void {
-  if (jobManager) {
-    jobManager.disposeAll();
-    jobManager = null;
-  }
+  jobsRuntime?.disposeAll();
+  jobsRuntime = null;
 }

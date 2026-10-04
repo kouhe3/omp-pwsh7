@@ -391,6 +391,12 @@ export class PwshSession {
     this.#pending.clear();
   }
 
+  /** The live pwsh process id, when this session has one running. */
+  get pid(): number | undefined {
+    const live = this.#proc;
+    return live && !live.killed ? live.pid : undefined;
+  }
+
   /** Dispose: kill the process tree and drop the session. */
   async dispose(): Promise<void> {
     const live = this.#proc;
@@ -439,6 +445,12 @@ export class PwshSessionPool {
       this.#sessions.delete(key);
       void s.dispose();
     }
+  }
+
+  /** Live pids for a pooled session, for job inspectors (empty once it is gone). */
+  pidFor(key: string): readonly number[] {
+    const pid = this.#sessions.get(key)?.pid;
+    return pid == null ? [] : [pid];
   }
 
   disposeAll(): void {
