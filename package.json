@@ -15,7 +15,7 @@
     "shiki": "^4.4.3"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "file:vendor/pi-coding-agent-304a44d8.tgz",
+    "@oh-my-pi/pi-coding-agent": "file:vendor/pi-coding-agent-012e804e.tgz",
     "@oh-my-pi/pi-tui": "^18.4.1",
     "@types/bun": "^1.4.2",
     "typescript": "^7.0.2"

@@ -21,6 +21,9 @@
  * Usage:
  *   bun scripts/pack-fork-dep.ts [--fork <path>] [--vendor <dir>]
  *
+ * A fresh clone cannot `bun install` before the tarball exists (`vendor/` is
+ * gitignored), so run this script first — it needs no node_modules.
+ *
  * The fork's `packages/coding-agent/package.json` is rewritten for the pack and
  * restored in a `finally`, so the fork checkout ends clean.
  */
@@ -71,7 +74,9 @@ async function main(): Promise<void> {
 	// Named cast: this path is our own fork checkout's manifest, not external input.
 	const sourceManifest = JSON.parse(original) as PackManifest;
 	const version = sourceManifest.version ?? "0.0.0";
-	const sha = (await $`git -C ${fork} rev-parse --short=8 HEAD`.text()).trim();
+	// Keyed on the package subtree, not HEAD: a root-level docs commit must not
+	// rename the tarball (and churn the devDependency specifier).
+	const pkgRev = (await $`git -C ${fork} rev-parse --short=8 HEAD:${PACKAGE_DIR}`.text()).trim();
 
 	try {
 		// Declarations first: the pack must ship them, and the rewrite below
@@ -99,7 +104,7 @@ async function main(): Promise<void> {
 		await $`bun pm pack --destination ${vendorDir}`.cwd(packageDir);
 
 		const packed = path.join(vendorDir, `oh-my-pi-pi-coding-agent-${version}.tgz`);
-		const vendored = path.join(vendorDir, `pi-coding-agent-${sha}.tgz`);
+		const vendored = path.join(vendorDir, `pi-coding-agent-${pkgRev}.tgz`);
 		await fs.rename(packed, vendored);
 
 		const extensionManifestPath = path.join(extensionRoot, "package.json");
@@ -108,7 +113,7 @@ async function main(): Promise<void> {
 		extensionManifest.devDependencies["@oh-my-pi/pi-coding-agent"] = `file:vendor/${path.basename(vendored)}`;
 		await Bun.write(extensionManifestPath, `${JSON.stringify(extensionManifest, null, 2)}\n`);
 
-		console.log(`packed ${path.relative(extensionRoot, vendored)} (fork ${sha}, v${version})`);
+		console.log(`packed ${path.relative(extensionRoot, vendored)} (${PACKAGE_DIR}@${pkgRev}, v${version})`);
 		console.log("next: bun install && bun run typecheck && bun test");
 	} finally {
 		// The rewrite mutates a tracked manifest; never leave the fork dirty.
