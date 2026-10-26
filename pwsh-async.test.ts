@@ -1,13 +1,22 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { definePwshTool, getJobManager, resetJobManager } from "./pwsh-tool";
+import {
+  definePwshTool,
+  getJobManager,
+  resetJobManager,
+  runPwsh,
+} from "./pwsh-tool";
 import {
   MAX_RETAINED_SETTLED_JOBS,
   PwshJobManager,
   jobLabel,
   type PwshJob,
 } from "./job";
-import type { PwshSessionPool } from "./session";
+import { PwshSessionPool } from "./session";
+
+// Real background jobs spawn real sessions; bun's 5s default is a machine-speed
+// budget, not an assertion.
+setDefaultTimeout(30_000);
 
 // Mock schema builder similar to zod
 const schema = () => {
@@ -113,11 +122,14 @@ function makeTool() {
    * Replay `tool_execution_start` for pwsh, as the host loop emits it. `from`
    * overrides the context (a subagent session reports `hasUI: false`).
    */
-  const fireStart = (event: {
-    toolCallId: string;
-    args: unknown;
-    intent?: string;
-  }, from: unknown = ctx) => {
+  const fireStart = (
+    event: {
+      toolCallId: string;
+      args: unknown;
+      intent?: string;
+    },
+    from: unknown = ctx,
+  ) => {
     for (const handler of starts) {
       handler({ toolName: "pwsh", ...event }, from);
     }
@@ -141,7 +153,9 @@ function messageText(sent: SentMessage | undefined): string {
 
 test("schema accepts async, jobId, and action parameters", () => {
   const tool = definePwshTool({ zod: zStub } as never);
-  const shape = (tool.parameters as unknown as { shape: Record<string, unknown> }).shape;
+  const shape = (
+    tool.parameters as unknown as { shape: Record<string, unknown> }
+  ).shape;
 
   expect(shape).toBeDefined();
   expect(shape.async).toBeDefined();
@@ -196,7 +210,12 @@ test("starts an async job immediately without blocking and delivers result via s
   const delivery = sentMessages[0]!;
   const rawMsg = delivery.message;
   expect(rawMsg).toBeDefined();
-  if (rawMsg && typeof rawMsg === "object" && "customType" in rawMsg && "details" in rawMsg) {
+  if (
+    rawMsg &&
+    typeof rawMsg === "object" &&
+    "customType" in rawMsg &&
+    "details" in rawMsg
+  ) {
     const msg = rawMsg as {
       customType: string;
       content: string;
@@ -256,12 +275,11 @@ test("can inspect status and kill a running async job", async () => {
 
   // Verify ergonomic card rendering for running async job (Case 1: No body, direct status bottom)
   const runningRows = tool
-    .renderResult(
-      { details: res.details },
-      { expanded: false },
-      theme,
-      { command: "Start-Sleep -Seconds 10; Write-Output 'done'", async: true, jobId },
-    )
+    .renderResult({ details: res.details }, { expanded: false }, theme, {
+      command: "Start-Sleep -Seconds 10; Write-Output 'done'",
+      async: true,
+      jobId,
+    })
     .render(80);
   const runningCard = runningRows.join("\n");
 
@@ -270,16 +288,16 @@ test("can inspect status and kill a running async job", async () => {
   // Ergonomic check: No divider followed by bottom border (no double bottom lines)
   expect(runningCard).not.toContain("├───");
   expect(runningRows[runningRows.length - 1]).toContain("running");
-  expect(Bun.stripANSI(runningRows[runningRows.length - 1]!).startsWith("╰")).toBe(true);
+  expect(
+    Bun.stripANSI(runningRows[runningRows.length - 1]!).startsWith("╰"),
+  ).toBe(true);
 
   // Verify ergonomic card rendering for killed job (Case 1 with fallback title and command context)
   const killedRows = tool
-    .renderResult(
-      { details: killRes.details },
-      { expanded: false },
-      theme,
-      { jobId, action: "kill" },
-    )
+    .renderResult({ details: killRes.details }, { expanded: false }, theme, {
+      jobId,
+      action: "kill",
+    })
     .render(80);
   const killedCard = killedRows.join("\n");
 
@@ -291,30 +309,42 @@ test("can inspect status and kill a running async job", async () => {
   expect(killedCard).toContain("Start-Sleep");
   // Ergonomic check: Closing line has the status directly
   expect(killedRows[killedRows.length - 1]).toContain("killed");
-  expect(Bun.stripANSI(killedRows[killedRows.length - 1]!).startsWith("╰")).toBe(true);
+  expect(
+    Bun.stripANSI(killedRows[killedRows.length - 1]!).startsWith("╰"),
+  ).toBe(true);
 
   // Ensure all rows have exact same visual column width
-  const widths = killedRows.map((r) => Bun.stringWidth(r, { countAnsiEscapeCodes: false }));
+  const widths = killedRows.map((r) =>
+    Bun.stringWidth(r, { countAnsiEscapeCodes: false }),
+  );
   expect(new Set(widths).size).toBe(1);
 });
 
 test("handles command interruption by message gracefully", async () => {
-  const tool = definePwshTool({ zod: zStub } as never);
+  // Auto-backgrounding off: a steering interrupt is a plain cancellation. With
+  // it on, the same interrupt detaches the command instead (see
+  // `pwsh-autobg.test.ts`).
+  const pool = new PwshSessionPool();
   const controller = new AbortController();
 
   // Start command and abort with message-interrupt reason
-  const runPromise = tool.execute(
-    "call_interrupt",
-    { command: "Write-Output 'pre-interrupt'; Start-Sleep -Seconds 5; Write-Output 'post'" },
-    controller.signal,
+  const runPromise = runPwsh(
+    {
+      command:
+        "Write-Output 'pre-interrupt'; Start-Sleep -Seconds 5; Write-Output 'post'",
+    },
+    pool,
     undefined,
+    controller.signal,
+    { enabled: false, thresholdMs: 60_000 },
   );
 
   // Abort with TOOL_INTERRUPT_ABORT_REASON
   controller.abort(Symbol.for("pi-agent-core.tool-interrupt"));
   const res = await runPromise;
 
-  expect(res.content[0]?.text).toContain("Command interrupted by message");
+  expect(res.text).toContain("Command interrupted by message");
+  pool.disposeAll();
 });
 
 test("disposes worker session in pool upon job completion to prevent subprocess leaks", async () => {
@@ -331,7 +361,10 @@ test("disposes worker session in pool upon job completion to prevent subprocess 
   } as unknown as PwshSessionPool;
 
   const jm = new PwshJobManager(fakePool);
-  const job = jm.startJob({ command: "Write-Output 'done'", cwd: process.cwd() });
+  const job = jm.startJob({
+    command: "Write-Output 'done'",
+    cwd: process.cwd(),
+  });
   await job.settled;
 
   expect(job.status).toBe("completed");
@@ -391,7 +424,9 @@ test("reports accurate status and wall time when inspecting a finished job", asy
     undefined,
     undefined,
   );
-  expect(killAfterDone.content[0]?.text).toContain("is not running (status: completed)");
+  expect(killAfterDone.content[0]?.text).toContain(
+    "is not running (status: completed)",
+  );
   expect(killAfterDone.details.status).toBe("completed");
 });
 
@@ -401,7 +436,15 @@ test("callLabel sanitizes multi-line jobId and prevents visual frame splitting",
 
   const rows = tool
     .renderResult(
-      { details: { cwd: process.cwd(), sessionKey: "k", format: "text", timeoutSec: 120, wallTimeMs: 0 } },
+      {
+        details: {
+          cwd: process.cwd(),
+          sessionKey: "k",
+          format: "text",
+          timeoutSec: 120,
+          wallTimeMs: 0,
+        },
+      },
       { expanded: false },
       theme,
       { jobId: multiLineJobId, action: "kill" },
@@ -510,7 +553,18 @@ test("renders failed async job with failed indicator rather than false completed
   const tool = definePwshTool({ zod: zStub } as never);
   const rows = tool
     .renderResult(
-      { details: { cwd: process.cwd(), sessionKey: "k", format: "text", timeoutSec: 120, wallTimeMs: 1500, async: true, jobId: "pwsh_fail", status: "failed" } },
+      {
+        details: {
+          cwd: process.cwd(),
+          sessionKey: "k",
+          format: "text",
+          timeoutSec: 120,
+          wallTimeMs: 1500,
+          async: true,
+          jobId: "pwsh_fail",
+          status: "failed",
+        },
+      },
       { expanded: false },
       theme,
       { jobId: "pwsh_fail", action: "status" },
@@ -638,8 +692,16 @@ test("sanitizes async completion notification label and preserves command in sta
   expect(sentMessages.length).toBe(1);
   const msg = sentMessages[0]?.message;
   let label: string | undefined;
-  if (msg && typeof msg === "object" && "details" in msg && msg.details && typeof msg.details === "object" && "label" in msg.details) {
-    label = typeof msg.details.label === "string" ? msg.details.label : undefined;
+  if (
+    msg &&
+    typeof msg === "object" &&
+    "details" in msg &&
+    msg.details &&
+    typeof msg.details === "object" &&
+    "label" in msg.details
+  ) {
+    label =
+      typeof msg.details.label === "string" ? msg.details.label : undefined;
   }
   expect(label).toBeDefined();
   expect(label).not.toContain("\n");
@@ -652,7 +714,12 @@ test("action 'wait' blocks until the job settles and claims the result without a
     command: "Start-Sleep -Milliseconds 500; Write-Output 'wait-finished'",
   });
 
-  const waitRes = await tool.execute("call_wait", { jobId, action: "wait" }, undefined, undefined);
+  const waitRes = await tool.execute(
+    "call_wait",
+    { jobId, action: "wait" },
+    undefined,
+    undefined,
+  );
 
   // Terminal state proves the call blocked until settlement, not that it peeked.
   expect(waitRes.details.status).toBe("completed");
@@ -711,7 +778,11 @@ test("renders 'Wait job <jobId>' card header when intent is omitted for action '
   const tool = definePwshTool({ zod: zStub } as never);
   const jobId = "pwsh_test_wait_label";
   const rows = tool
-    .renderCall({ jobId, action: "wait" }, { argsComplete: true }, theme as never)
+    .renderCall(
+      { jobId, action: "wait" },
+      { argsComplete: true },
+      theme as never,
+    )
     .render(80);
   const header = Bun.stripANSI(rows[0] ?? "");
   expect(header).toContain(`Wait job ${jobId}`);
@@ -729,7 +800,8 @@ test("falls back to 'Job status <jobId>' when a jobId carries no action", () => 
 test("abort signal interrupts 'wait' action and detaches waiter so later completion still delivers", async () => {
   const { tool, sentMessages, startJob } = makeTool();
   const { jobId } = await startJob("call_wait_abort_start", {
-    command: "Start-Sleep -Milliseconds 600; Write-Output 'aborted-wait-finished'",
+    command:
+      "Start-Sleep -Milliseconds 600; Write-Output 'aborted-wait-finished'",
   });
 
   const controller = new AbortController();
@@ -755,7 +827,8 @@ test("abort signal interrupts 'wait' action and detaches waiter so later complet
 test("action 'wait' with timeout: 0 waits indefinitely until job completion", async () => {
   const { tool, sentMessages, startJob } = makeTool();
   const { jobId } = await startJob("call_wait_zero_start", {
-    command: "Start-Sleep -Milliseconds 300; Write-Output 'zero-timeout-finished'",
+    command:
+      "Start-Sleep -Milliseconds 300; Write-Output 'zero-timeout-finished'",
   });
 
   const waitRes = await tool.execute(
@@ -780,11 +853,21 @@ test("action 'wait' on an already settled job returns the shared snapshot withou
   // The job completed with no waiter attached, so the aside went out once.
   expect(sentMessages.length).toBe(1);
 
-  const waitRes = await tool.execute("call_wait_settled", { jobId, action: "wait" }, undefined, undefined);
+  const waitRes = await tool.execute(
+    "call_wait_settled",
+    { jobId, action: "wait" },
+    undefined,
+    undefined,
+  );
 
   // Falls through to the shared snapshot: a wait that already settled must be
   // byte-identical to a plain status inspection of the same job.
-  const statusRes = await tool.execute("call_wait_settled_status", { jobId }, undefined, undefined);
+  const statusRes = await tool.execute(
+    "call_wait_settled_status",
+    { jobId },
+    undefined,
+    undefined,
+  );
   expect(waitRes.content[0]?.text).toBe(statusRes.content[0]?.text);
   expect(waitRes.details).toEqual(statusRes.details);
   expect(waitRes.details.status).toBe("completed");
@@ -798,7 +881,12 @@ test("action 'wait' surfaces a failed job as an error result instead of an aside
     command: "throw 'boom-failed'",
   });
 
-  const waitRes = await tool.execute("call_wait_failed", { jobId, action: "wait" }, undefined, undefined);
+  const waitRes = await tool.execute(
+    "call_wait_failed",
+    { jobId, action: "wait" },
+    undefined,
+    undefined,
+  );
 
   // The failure is the point of waiting: it must reach the model as isError,
   // and the suppressed aside must not re-deliver it.
@@ -853,7 +941,12 @@ test("an async job that calls exit N fails with that code instead of reporting s
     command: "Write-Output 'job-before-exit'; exit 4",
   });
 
-  const waitRes = await tool.execute("call_exit_job_wait", { jobId, action: "wait" }, undefined, undefined);
+  const waitRes = await tool.execute(
+    "call_exit_job_wait",
+    { jobId, action: "wait" },
+    undefined,
+    undefined,
+  );
 
   expect(waitRes.details.exitCode).toBe(4);
   expect(waitRes.details.status).toBe("failed");
@@ -868,7 +961,12 @@ test("an async job that calls exit 0 still reports success", async () => {
     command: "Write-Output 'zero-ok'; exit 0",
   });
 
-  const waitRes = await tool.execute("call_exit_zero_wait", { jobId, action: "wait" }, undefined, undefined);
+  const waitRes = await tool.execute(
+    "call_exit_zero_wait",
+    { jobId, action: "wait" },
+    undefined,
+    undefined,
+  );
 
   expect(waitRes.details.exitCode).toBe(0);
   expect(waitRes.details.status).toBe("completed");
@@ -928,7 +1026,12 @@ test("labels a listed job from the intent recorded on tool_execution_start", asy
   // copy of the args (`transformToolCallArguments`, `deobfuscateToolArguments`),
   // modelled here by two distinct objects under one id.
   const executeArgs = { command: "Start-Sleep -Milliseconds 300", async: true };
-  const res = await tool.execute("call_late_intent", executeArgs, undefined, undefined);
+  const res = await tool.execute(
+    "call_late_intent",
+    executeArgs,
+    undefined,
+    undefined,
+  );
   const jobId = res.details.jobId ?? "";
   fireStart({
     toolCallId: "call_late_intent",
@@ -950,7 +1053,11 @@ test("a subagent context cannot hijack the footer slot from the interactive sess
   const { jobId } = await startJob("call_parent", {
     command: "Start-Sleep -Milliseconds 300",
   });
-  fireStart({ toolCallId: "call_parent", args: { async: true }, intent: "Parent job" });
+  fireStart({
+    toolCallId: "call_parent",
+    args: { async: true },
+    intent: "Parent job",
+  });
   expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", "pwsh 1 running"]);
 
   // A subagent session re-binds this module's factories and reports
@@ -958,7 +1065,10 @@ test("a subagent context cannot hijack the footer slot from the interactive sess
   // reset would land there and the interactive footer would keep the stale
   // count. The list must stay untouched.
   const noUiCtx = { hasUI: false, ui: { setStatus: () => {} } };
-  fireStart({ toolCallId: "call_child", args: { async: true }, intent: "Child job" }, noUiCtx);
+  fireStart(
+    { toolCallId: "call_child", args: { async: true }, intent: "Child job" },
+    noUiCtx,
+  );
 
   await getJobManager().getJob(jobId)?.settled;
   expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", undefined]);

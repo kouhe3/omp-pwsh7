@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +7,11 @@ import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import { buildSessionKey, definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 import { getHighlighterInstance, highlightPowerShell } from "./syntax";
+
+// Every test here drives a real `pwsh` process; a restart case is a spawn, a
+// taskkill (1.5s grace) and another spawn, which overruns bun's 5s default on a
+// busy machine while asserting nothing extra about speed.
+setDefaultTimeout(30_000);
 
 const schema = () => ({
   describe() {
@@ -75,7 +80,9 @@ const theme = {
 function renderCommand(command: string, width: number): string[] {
   const tool = definePwshTool({ zod: zStub } as never);
   // Frame assertions describe the completed-args state; the pending row is covered separately.
-  return tool.renderCall({ command }, { argsComplete: true }, theme).render(width);
+  return tool
+    .renderCall({ command }, { argsComplete: true }, theme)
+    .render(width);
 }
 
 test("renders the complete long command instead of replacing its tail with an ellipsis", () => {
@@ -553,10 +560,7 @@ test("restart swaps the process and drops the session's state", async () => {
     const cwd = process.cwd();
     const session = `restart-state-${Date.now()}`;
     const key = buildSessionKey(cwd, session);
-    await runPwsh(
-      { command: "$restartMarker = 'kept'", session, cwd },
-      pool,
-    );
+    await runPwsh({ command: "$restartMarker = 'kept'", session, cwd }, pool);
     const oldPid = pool.pidFor(key)[0];
     expect(oldPid).toBeGreaterThan(0);
 
@@ -711,7 +715,11 @@ test("a restart reports a fresh process that failed to start", async () => {
   });
   try {
     const result = await runPwsh(
-      { session: `restart-nostart-${Date.now()}`, cwd: process.cwd(), restart: true },
+      {
+        session: `restart-nostart-${Date.now()}`,
+        cwd: process.cwd(),
+        restart: true,
+      },
       pool,
     );
 
@@ -1012,7 +1020,11 @@ test("a multi-line intent cannot split a card row", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const intent = "List\nlarge files";
   const pending = tool
-    .renderCall({ i: intent, command: "Get-Chil" }, { argsComplete: false }, theme)
+    .renderCall(
+      { i: intent, command: "Get-Chil" },
+      { argsComplete: false },
+      theme,
+    )
     .render(60);
   const settled = tool
     .renderResult(
@@ -1046,7 +1058,9 @@ test("renderCall shows a working directory only when the call asked for one", ()
   const render = (cwd?: string) =>
     tool
       .renderCall(
-        cwd === undefined ? { command: "Get-Date" } : { command: "Get-Date", cwd },
+        cwd === undefined
+          ? { command: "Get-Date" }
+          : { command: "Get-Date", cwd },
         { argsComplete: true },
         theme,
       )
@@ -1091,12 +1105,10 @@ test("renderResult titles the merged card with the intent and no cwd the call di
     output: "42\n",
   };
   const rendered = tool
-    .renderResult(
-      { details },
-      { expanded: false },
-      theme,
-      { i: "Read a missing path", command: "Get-Date" },
-    )
+    .renderResult({ details }, { expanded: false }, theme, {
+      i: "Read a missing path",
+      command: "Get-Date",
+    })
     .render(120)
     .join("\n");
 
@@ -1169,12 +1181,7 @@ test("titles a card the streamed call never saw, from the execution-start intent
     intent: "List every file",
   });
   const merged = tool
-    .renderResult(
-      { details: mergedDetails },
-      { expanded: false },
-      theme,
-      args,
-    )
+    .renderResult({ details: mergedDetails }, { expanded: false }, theme, args)
     .render(100)
     .join("\n");
 
@@ -1202,12 +1209,9 @@ test("flattens a host-recorded intent so it cannot split the card row", () => {
 test("falls back to the tool label when no intent was ever declared or recorded", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const merged = tool
-    .renderResult(
-      { details: mergedDetails },
-      { expanded: false },
-      theme,
-      { command: "Get-ChildItem" },
-    )
+    .renderResult({ details: mergedDetails }, { expanded: false }, theme, {
+      command: "Get-ChildItem",
+    })
     .render(100)
     .join("\n");
 
@@ -1243,10 +1247,16 @@ test("every frame row occupies the same number of columns", () => {
     `${"x".repeat(200)}\nemoji 🐈 mid-line ${"y".repeat(40)}\n`,
   ];
   const cases = [
-    ...payloads.map((output) => ({ output, intent: undefined as string | undefined })),
+    ...payloads.map((output) => ({
+      output,
+      intent: undefined as string | undefined,
+    })),
     // A model-authored intent longer than the frame is the case that used to
     // floor `frameTop`'s fill at 0 and push the top bar past the right corner.
-    { output: payloads[0]!, intent: "Explain why the deployment script keeps failing ".repeat(3) },
+    {
+      output: payloads[0]!,
+      intent: "Explain why the deployment script keeps failing ".repeat(3),
+    },
   ];
   // 40 columns is narrower than the status label (`✓ completed · Wall: … |
   // Timeout: 120s`), which is what made the divider row overflow.
@@ -1270,7 +1280,9 @@ test("every frame row occupies the same number of columns", () => {
           { i: intent, command: "Get-Date" },
         )
         .render(width);
-      const widths = rows.map((row) => Bun.stringWidth(row, { countAnsiEscapeCodes: false }));
+      const widths = rows.map((row) =>
+        Bun.stringWidth(row, { countAnsiEscapeCodes: false }),
+      );
 
       expect(new Set(widths).size).toBe(1);
       // No row may be wider than the box the host allocated for the component.
@@ -1282,10 +1294,18 @@ test("every frame row occupies the same number of columns", () => {
 test("renderCall survives a non-string intent from the streamed args", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const pending = tool
-    .renderCall({ i: 1 as never, command: "Get-Da" }, { argsComplete: false }, theme)
+    .renderCall(
+      { i: 1 as never, command: "Get-Da" },
+      { argsComplete: false },
+      theme,
+    )
     .render(60);
   const complete = tool
-    .renderCall({ i: { text: "x" } as never, command: "Get-Date" }, { argsComplete: true }, theme)
+    .renderCall(
+      { i: { text: "x" } as never, command: "Get-Date" },
+      { argsComplete: true },
+      theme,
+    )
     .render(60);
 
   expect(pending.join("\n")).toContain("PowerShell 7");

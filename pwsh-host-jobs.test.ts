@@ -6,7 +6,11 @@ import {
   type HostAsyncJobs,
 } from "./host-jobs";
 import { getJobManager, resetJobManager } from "./pwsh-tool";
-import { MAX_RETAINED_SETTLED_JOBS } from "./job";
+import {
+  MAX_RETAINED_SETTLED_JOBS,
+  type AdoptJobOptions,
+  type PwshJob,
+} from "./job";
 import type { PwshRunOptions, PwshRunResult, PwshSessionPool } from "./session";
 
 interface RegisteredJob {
@@ -44,7 +48,10 @@ function fakeHost() {
 }
 
 /** Pool stub: one session per key, answering with a canned run result. */
-function fakePool(result: PwshRunResult, onRun?: (options: PwshRunOptions) => void) {
+function fakePool(
+  result: PwshRunResult,
+  onRun?: (options: PwshRunOptions) => void,
+) {
   const disposed: string[] = [];
   const pid = 4242;
   const pool = {
@@ -71,7 +78,9 @@ function completed(output: string, exitCode = 0): PwshRunResult {
 }
 
 /** Awaited rejection as a value: `expect(p).rejects` is typed void in bun:test. */
-async function rejectionOf(promise: Promise<unknown>): Promise<Error | undefined> {
+async function rejectionOf(
+  promise: Promise<unknown>,
+): Promise<Error | undefined> {
   try {
     await promise;
     return undefined;
@@ -161,7 +170,9 @@ test("startJob registers a pwsh job with the host and reports its result", async
 test("streamed output reaches the host as progress and stays on the job record", async () => {
   const host = fakeHost();
   const frames: Array<Record<string, unknown> | undefined> = [];
-  const { pool } = fakePool(completed("done"), (options) => options.onChunk?.("partial\n"));
+  const { pool } = fakePool(completed("done"), (options) =>
+    options.onChunk?.("partial\n"),
+  );
   const runtime = new HostPwshJobs(host.surface, pool);
   const job = runtime.startJob({ command: "Start-Sleep 1", cwd: "C:/work" });
 
@@ -212,7 +223,9 @@ test("killJob cancels through the host and settles the body as cancelled", async
 
 test("a failed command is delivered as an error, and a refused register leaves no record", async () => {
   const host = fakeHost();
-  const { pool } = fakePool({ response: { id: 1, output: "", exitCode: 2, error: "boom" } });
+  const { pool } = fakePool({
+    response: { id: 1, output: "", exitCode: 2, error: "boom" },
+  });
   const runtime = new HostPwshJobs(host.surface, pool);
   const job = runtime.startJob({ command: "exit 2", cwd: "C:/work" });
 
@@ -349,4 +362,128 @@ test("a session run that throws settles the job as failed", async () => {
   expect(job.status).toBe("failed");
   expect(job.error).toBe("spawn failed");
   expect((await job.settled).status).toBe("failed");
+});
+
+/**
+ * Everything `adoptJob` needs for a foreground command that is already running:
+ * an abort controller the tool owns, a deferred fold, and a progress handle the
+ * test can drive like the tool's output pump.
+ */
+function adoption(options: Partial<AdoptJobOptions> = {}) {
+  const abortController = new AbortController();
+  const folded = Promise.withResolvers<PwshJob>();
+  const sinks: Array<(tail: string) => void> = [];
+  const adoptOptions: AdoptJobOptions = {
+    command: "Start-Sleep -Seconds 30",
+    cwd: "C:/work",
+    sessionKey: "C:/work\n",
+    startTime: 1_000,
+    output: "pre\n",
+    timeoutSec: 30,
+    intent: "Sleeping then printing",
+    abortController,
+    settled: folded.promise,
+    onProgress: (sink) => {
+      sinks.push(sink);
+      return () => {
+        const index = sinks.indexOf(sink);
+        if (index >= 0) sinks.splice(index, 1);
+      };
+    },
+    ...options,
+  };
+  return { adoptOptions, abortController, folded, sinks };
+}
+
+/** Resolve the fold as a settled run would, then let the body's continuation run. */
+async function settleAdoption(
+  job: PwshJob,
+  folded: { resolve(value: PwshJob): void },
+  status: PwshJob["status"],
+): Promise<void> {
+  job.status = status;
+  job.endTime = job.startTime + 500;
+  folded.resolve(job);
+  await Promise.resolve();
+}
+
+test("adoptJob registers the running command with the host", async () => {
+  const host = fakeHost();
+  const { pool, pid } = fakePool(completed("unused"));
+  const runtime = new HostPwshJobs(host.surface, pool);
+  const { adoptOptions, folded, sinks } = adoption();
+  const reported: string[] = [];
+
+  const job = runtime.adoptJob(adoptOptions);
+
+  expect(job).toBeDefined();
+  expect(runtime.getJob(job!.id)).toBe(job);
+  expect(host.jobs).toHaveLength(1);
+  expect(host.jobs[0]?.kind).toBe("pwsh");
+  expect(host.jobs[0]?.label).toBe("Sleeping then printing");
+  // The elapsed clock starts at the command's own start, not at adoption.
+  expect(job!.startTime).toBe(1_000);
+  expect(job!.output).toBe("pre\n");
+  // The jobs sheet reports the session the command already owns.
+  expect(host.jobs[0]?.process?.pids()).toEqual([pid]);
+  expect(job!.settled).toBe(folded.promise);
+
+  const body = host.jobs[0]!.run({
+    jobId: job!.id,
+    signal: new AbortController().signal,
+    reportProgress: async (text) => {
+      reported.push(text);
+    },
+  });
+  // Output streamed after adoption reaches the job's progress row.
+  expect(sinks).toHaveLength(1);
+  sinks[0]?.("tail\n");
+  await Promise.resolve();
+  expect(reported).toEqual(["tail\n"]);
+
+  await settleAdoption(job!, folded, "completed");
+  expect(await body).toContain("completed");
+});
+
+test("a host cancel is mirrored onto the command's own controller", async () => {
+  const host = fakeHost();
+  const { pool } = fakePool(completed("unused"));
+  const runtime = new HostPwshJobs(host.surface, pool);
+  const { adoptOptions, abortController, folded } = adoption();
+  const job = runtime.adoptJob(adoptOptions)!;
+  const body = host.jobs[0]!.run({
+    jobId: job.id,
+    signal: host.controllers.get(job.id)!.signal,
+    reportProgress: async () => {},
+  });
+
+  // The jobs sheet (or session teardown) cancels the host job: the command keeps
+  // running until its own controller is aborted, which is what must happen.
+  expect(abortController.signal.aborted).toBe(false);
+  expect(host.surface.cancel(job.id)).toBe(true);
+  await Promise.resolve();
+  expect(abortController.signal.aborted).toBe(true);
+
+  // A cancelled job reports cancellation instead of delivering a result.
+  await settleAdoption(job, folded, "killed");
+  expect((await rejectionOf(body))?.message).toBe("Cancelled.");
+});
+
+test("adoptJob reports failure when the host refuses the job", () => {
+  const refusing = {
+    register() {
+      throw new Error("Background job limit reached (15).");
+    },
+    cancel() {
+      return false;
+    },
+  };
+  const { pool } = fakePool(completed("unused"));
+  const runtime = new HostPwshJobs(refusing, pool);
+  const { adoptOptions, abortController } = adoption();
+
+  expect(runtime.adoptJob(adoptOptions)).toBeUndefined();
+  expect(runtime.listJobs()).toHaveLength(0);
+  // The command was not cancelled by the refusal: it stays with the caller.
+  expect(abortController.signal.aborted).toBe(false);
 });

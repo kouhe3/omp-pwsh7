@@ -20,6 +20,7 @@
  * into that host.
  */
 import {
+  type AdoptJobOptions,
   DEFAULT_TIMEOUT_SEC,
   jobLabel,
   jobResultText,
@@ -191,6 +192,92 @@ export class HostPwshJobs implements PwshJobsRuntime {
       // the caller must not keep a record: drop the aborted controller's job.
       controller.abort();
       throw error;
+    }
+    job.id = id;
+    this.#jobs.set(id, job);
+    this.#jobsChanged?.();
+    return job;
+  }
+
+  /**
+   * Take over a running foreground command by registering a host job that waits
+   * for it: the host owns delivery, the jobs sheet gets a row with the session's
+   * live pid, and a jobs-sheet cancel mirrors onto the command's controller.
+   * `undefined` when the host is at its running-job cap — the foreground call
+   * then keeps waiting for its own command.
+   */
+  adoptJob(options: AdoptJobOptions): PwshJob | undefined {
+    const job: PwshJob = {
+      // Replaced by the host's id below, and by the run context's id if the
+      // manager starts the body before `register` returns.
+      id: `pwsh_pending_${++this.#seq}`,
+      command: options.command,
+      sessionKey: options.sessionKey,
+      cwd: options.cwd,
+      startTime: options.startTime,
+      timeoutSec: options.timeoutSec,
+      status: "running",
+      output: options.output,
+      intent: options.intent,
+      resolveIntent: options.resolveIntent,
+      abortController: options.abortController,
+      settled: options.settled,
+    };
+
+    let id: string;
+    try {
+      id = this.#asyncJobs.register(
+        "pwsh",
+        jobLabel(job),
+        async (ctx) => {
+          job.id = ctx.jobId;
+          const unsubscribe = options.onProgress((tail) => {
+            void ctx
+              .reportProgress(tail, {
+                output: tail,
+                async: { state: "running", jobId: ctx.jobId, type: "pwsh" },
+              })
+              .catch(() => {});
+          });
+          // The host's cancel paths (jobs sheet, session teardown) abort
+          // `ctx.signal`. The command belongs to the foreground call, whose
+          // controller is the only thing that can kill it, so mirror the abort
+          // there instead of acting on the signal here.
+          const mirrorAbort = () =>
+            options.abortController.abort(ctx.signal.reason);
+          if (ctx.signal.aborted) mirrorAbort();
+          else
+            ctx.signal.addEventListener("abort", mirrorAbort, { once: true });
+          try {
+            await options.settled;
+          } finally {
+            unsubscribe();
+            ctx.signal.removeEventListener("abort", mirrorAbort);
+            pruneSettledJobs(this.#jobs, () => false);
+            this.#jobsChanged?.();
+          }
+          // A cancelled job keeps the manager's `cancelled` status and its
+          // delivery suppressed; throwing is how the body reports that.
+          if (job.status === "killed") throw new Error("Cancelled.");
+          if (job.status === "failed") {
+            throw new Error(job.error ?? "PowerShell command failed.");
+          }
+          return jobResultText(job);
+        },
+        {
+          process: {
+            command: options.command,
+            cwd: options.cwd,
+            // The command runs on the session it already owned (the persistent
+            // REPL session), so report that process rather than a job worker.
+            pids: () => this.#pool.pidFor(options.sessionKey),
+          },
+        },
+      );
+    } catch {
+      // Registering fails at the running-job cap. Nothing was queued, so the
+      // caller keeps its command and waits it out.
+      return undefined;
     }
     job.id = id;
     this.#jobs.set(id, job);

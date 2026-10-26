@@ -56,6 +56,36 @@ export interface PwshJob {
 export type PwshWaitOutcome = "settled" | "timeout" | "aborted";
 
 /**
+ * An in-flight foreground command a runtime takes over when the call
+ * auto-backgrounds: it keeps running on the session it already owns (never
+ * disposed by the runtime), and the runtime becomes responsible for listing,
+ * progress, cancellation, and completion delivery from here on.
+ */
+export interface AdoptJobOptions {
+  command: string;
+  cwd: string;
+  /** Session the command already runs on — the persistent session for pwsh. */
+  sessionKey: string;
+  /** Wall-clock start of the command, before adoption, so elapsed time is honest. */
+  startTime: number;
+  /** Output captured before adoption. */
+  output: string;
+  timeoutSec: number;
+  intent?: string;
+  resolveIntent?: () => string | undefined;
+  /** Cancels the command (kills its process tree); owned by the caller. */
+  abortController: AbortController;
+  /** Resolves with the record once the finished run has been folded into it. */
+  settled: Promise<PwshJob>;
+  /**
+   * Subscribes to output after adoption; the returned function unsubscribes.
+   * Runtimes with a live progress surface (the host jobs sheet) use it; one
+   * without a surface to feed may ignore it.
+   */
+  onProgress: (sink: (tail: string) => void) => () => void;
+}
+
+/**
  * Background-job surface the pwsh tool drives, implemented twice: the private
  * {@link PwshJobManager} (stock omp) and {@link HostPwshJobs} (omp's scoped
  * async-job manager, when the session exposes one). The tool and the renderers
@@ -72,6 +102,12 @@ export interface PwshJobsRuntime {
   listJobs(): readonly PwshJob[];
   getJob(id: string): PwshJob | undefined;
   startJob(options: StartJobOptions): PwshJob;
+  /**
+   * Take over an already-running foreground command (auto-backgrounding).
+   * Returns `undefined` when the runtime cannot take it — the host's
+   * running-job cap — and the caller must then keep waiting for the command.
+   */
+  adoptJob(options: AdoptJobOptions): PwshJob | undefined;
   killJob(id: string): PwshJob | undefined;
   waitJob(
     id: string,
@@ -294,10 +330,7 @@ function jobRow(job: PwshJob, now: number): string {
  * `/pwsh` listing: running jobs first, then the most recently settled ones.
  * One row per job — marker, id, elapsed time, label.
  */
-export function jobsReport(
-  jobs: readonly PwshJob[],
-  now = Date.now(),
-): string {
+export function jobsReport(jobs: readonly PwshJob[], now = Date.now()): string {
   if (jobs.length === 0) {
     return 'No PowerShell background jobs. Start one with pwsh { command: "…", async: true }.';
   }
@@ -403,6 +436,48 @@ export class PwshJobManager implements PwshJobsRuntime {
       },
     );
 
+    return job;
+  }
+
+  /**
+   * Take over a running foreground command. The record reuses the caller's
+   * abort controller (killing the command is the caller's mechanism) and
+   * settles when the caller folds the finished run into it, so delivery and
+   * retention behave exactly as for a started job.
+   */
+  adoptJob(options: AdoptJobOptions): PwshJob | undefined {
+    const id = this.generateJobId();
+    const job: PwshJob = {
+      id,
+      command: options.command,
+      sessionKey: options.sessionKey,
+      cwd: options.cwd,
+      startTime: options.startTime,
+      timeoutSec: options.timeoutSec,
+      status: "running",
+      output: options.output,
+      intent: options.intent,
+      resolveIntent: options.resolveIntent,
+      abortController: options.abortController,
+      settled: options.settled,
+    };
+    this.#jobs.set(id, job);
+    this.#jobsChanged?.();
+
+    void options.settled.then(() => {
+      // Same delivery contract as a started job: a killed job stays silent, a
+      // waiter that consumed the result suppresses the aside, and the record
+      // remains inspectable until retention prunes it.
+      if (
+        job.status !== "killed" &&
+        !this.#waiters.has(job) &&
+        this.#pi?.sendMessage
+      ) {
+        this.#deliverCompletion(job);
+      }
+      pruneSettledJobs(this.#jobs, (settled) => this.#waiters.has(settled));
+      this.#jobsChanged?.();
+    });
     return job;
   }
 

@@ -31,12 +31,36 @@ import {
 import { PwshSessionPool, type PwshRunResult } from "./session";
 import { HostPwshJobs, hostAsyncJobs } from "./host-jobs";
 import {
+  MAX_JOB_OUTPUT_CHARS,
   PwshJobManager,
+  appendPwshJobOutput,
+  finishPwshJob,
   jobsReport,
   type PwshJob,
   type PwshJobStatus,
   type PwshJobsRuntime,
 } from "./job";
+import {
+  TOOL_INTERRUPT_ABORT_REASON,
+  raceForegroundWait,
+  resolveAutoBackgroundWaitMs,
+} from "./auto-background";
+import {
+  DESCRIPTION_REFRESH_NOTE,
+  PWSH_COMMAND_USAGE,
+  SETTINGS_UNAVAILABLE_TEXT,
+  formatModeReport,
+  formatThresholdReport,
+  parsePwshCommand,
+  pwshArgumentCompletions,
+} from "./command";
+import {
+  describeAutoBackground,
+  readAutoBackgroundSettings,
+  setAutoBackgroundEnabled,
+  setAutoBackgroundThresholdMs,
+  settingsScopeOf,
+} from "./settings";
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
@@ -111,6 +135,8 @@ interface PwshApi {
   getOrCreate(key: string, cwd?: string): SessionLike;
   /** Kill and rebuild the session for `key`, returning the fresh one. */
   restart(key: string, cwd?: string): Promise<SessionLike>;
+  /** Drop a pooled session (kills its process tree); used by the stateless mode. */
+  dispose(key: string): void;
   /** Live pid(s) of the pooled session for `key`; empty when it has none. */
   pidFor(key: string): readonly number[];
 }
@@ -129,8 +155,19 @@ export function buildSessionKey(cwd: string, session?: string): string {
  */
 const SESSION_KEY_CONTROL_RE = /[\x00-\x1F\x7F]/;
 
+/**
+ * Counter behind the per-call session keys of auto-background mode. Each call
+ * gets its own key — and so its own process, started fresh and dropped when the
+ * command settles — which is what makes the mode stateless: nothing carries
+ * over between calls, and a backgrounded command cannot block a later one.
+ */
+let statelessSessionSeq = 0;
+
 /** Reason `cwd`/`session` cannot form a distinct pool key, or undefined when clean. */
-function sessionKeyInputError(cwd: string, session?: string): string | undefined {
+function sessionKeyInputError(
+  cwd: string,
+  session?: string,
+): string | undefined {
   if (SESSION_KEY_CONTROL_RE.test(cwd)) {
     return `cwd may not contain control characters: ${JSON.stringify(cwd)}`;
   }
@@ -165,12 +202,30 @@ function toolText(
   return isError ? { content, details, isError: true } : { content, details };
 }
 
+/**
+ * Auto-background policy for one call, resolved from the settings by the tool
+ * entry point (`runPwsh` stays settings-free so tests drive it directly).
+ */
+export interface PwshAutoBackground {
+  enabled: boolean;
+  /** Foreground wait before the call backgrounds; `0` backgrounds immediately. */
+  thresholdMs: number;
+  /** Runtime that adopts the in-flight command; absent in tests. */
+  runtime?: PwshJobsRuntime;
+  /**
+   * Label for the adopted job. `i` is stripped from the parameters before
+   * `execute` runs (intent tracing), so the tool resolves it by call id.
+   */
+  resolveIntent?: () => string | undefined;
+}
+
 /** Core execute body - split out for smoke tests. */
 export async function runPwsh(
   params: PwshParams,
   api: PwshApi,
   onUpdate?: (update: PwshUpdate) => void,
   signal?: AbortSignal,
+  autoBackground?: PwshAutoBackground,
 ): Promise<{ text: string; details: PwshDetails; isError?: boolean }> {
   const cwd = params.cwd ?? process.cwd();
   const command = params.command;
@@ -186,7 +241,13 @@ export async function runPwsh(
   }
   // Every session-key use flows through here (foreground and restart-only); the
   // async path keys off its job id, so it is not guarded. Fail before spawning.
-  const keyError = sessionKeyInputError(cwd, params.session);
+  // Auto-background mode reuses neither the `session` name nor a persistent
+  // session, so the name is not validated there (nothing keys off it).
+  const stateless = autoBackground?.enabled === true;
+  const keyError = sessionKeyInputError(
+    cwd,
+    stateless ? undefined : params.session,
+  );
   if (keyError) {
     return {
       text: keyError,
@@ -194,12 +255,24 @@ export async function runPwsh(
       isError: true,
     };
   }
+  // A restart in stateless mode has nothing to rebuild: the previous call's
+  // process was already gone when its command finished, which is also why the
+  // file-lock case a restart exists for cannot arise.
+  if (!command && stateless) {
+    const text =
+      "Nothing to restart: pwsh.autoBackground.enabled runs every call in its own fresh session, so no state (variables, modules, location) or file lock survives between calls. Pass a command to run one.";
+    return { text, details: emptyDetails(params, cwd, "") };
+  }
   const started = Date.now();
   onUpdate?.({
     content: [
       {
         type: "text",
-        text: `[pwsh] ${params.restart ? "restarting" : "running in"} session ${buildSessionKey(cwd, params.session)}…`,
+        text: `[pwsh] ${
+          stateless
+            ? "starting a fresh session"
+            : `${params.restart ? "restarting" : "running in"} session ${buildSessionKey(cwd, params.session)}`
+        }…`,
       },
     ],
   });
@@ -223,7 +296,9 @@ export async function runPwsh(
   const timeoutSec = normalizeTimeout(params.timeout);
   const width = normalizeWidth(params.width);
   const format = params.format === "json" ? "json" : "text";
-  const sessionKey = buildSessionKey(cwd, params.session);
+  const sessionKey = stateless
+    ? `auto:${++statelessSessionSeq}`
+    : buildSessionKey(cwd, params.session);
   const details: PwshDetails = {
     cwd,
     sessionKey,
@@ -234,7 +309,7 @@ export async function runPwsh(
 
   let previousPid: number | undefined;
   let session: SessionLike;
-  if (params.restart) {
+  if (params.restart && !stateless) {
     previousPid = api.pidFor(sessionKey)[0];
     session = await api.restart(sessionKey, cwd);
   } else {
@@ -262,49 +337,180 @@ export async function runPwsh(
       previousPid == null
         ? `pid ${session.pid}`
         : `pid ${previousPid} → ${session.pid}`;
-    const reset = previousPid == null
-      ? "Session state (variables, modules, location) was reset."
-      : "Session state (variables, modules, location) was reset and any file lock held by the old process was released.";
+    const reset =
+      previousPid == null
+        ? "Session state (variables, modules, location) was reset."
+        : "Session state (variables, modules, location) was reset and any file lock held by the old process was released.";
     return {
       text: `Restarted ${label} (${transition}). ${reset}`,
       details,
     };
   }
 
-  let streamPreview = "";
+  const timeoutMs = timeoutSec === 0 ? undefined : timeoutSec * 1000;
+  // With no runtime to adopt into (tests, or a host without a job surface)
+  // backgrounding would strand the command: keep the call in the foreground.
+  const autoBg:
+    | (PwshAutoBackground & { runtime: PwshJobsRuntime })
+    | undefined =
+    autoBackground?.enabled === true && autoBackground.runtime
+      ? { ...autoBackground, runtime: autoBackground.runtime }
+      : undefined;
 
-  const runResult = await session.run(
-    {
-      code: command,
-      env: params.env,
-      width,
-      format,
-    },
-    {
-      timeoutMs: timeoutSec === 0 ? undefined : timeoutSec * 1000,
-      signal,
-      onChunk:
-        format === "text"
-          ? (chunk) => {
-              streamPreview = (streamPreview + chunk).slice(
-                -STREAM_PREVIEW_CHARS,
-              );
-              onUpdate?.({
-                content: [{ type: "text", text: streamPreview }],
-                details: {
-                  cwd,
-                  sessionKey,
-                  format,
-                  timeoutSec,
-                  streaming: true,
-                  output: streamPreview,
-                  wallTimeMs: Date.now() - started,
-                },
-              });
-            }
-          : undefined,
-    },
-  );
+  let streamPreview = "";
+  /** Output kept for the job record this call becomes when it backgrounds. */
+  let backgroundOutput = "";
+  let backgroundJob: PwshJob | undefined;
+  const backgroundSettled = Promise.withResolvers<PwshJob>();
+  const progressSinks = new Set<(tail: string) => void>();
+  /**
+   * The run's own controller. A steering interrupt must leave the command
+   * running (it becomes a job), so the tool's signal is only bridged here for
+   * real cancellations, and only while the tool still owns the command.
+   */
+  const runController = new AbortController();
+  const bridgeAbort = () => {
+    if (signal?.aborted && signal.reason !== TOOL_INTERRUPT_ABORT_REASON) {
+      runController.abort(signal.reason);
+    }
+  };
+  const unbridgeAbort = () => signal?.removeEventListener("abort", bridgeAbort);
+  if (autoBg && signal) {
+    if (signal.aborted) bridgeAbort();
+    else signal.addEventListener("abort", bridgeAbort);
+  }
+  const onChunk = (chunk: string) => {
+    // Once adopted the call has returned: the record (and the runtime's own
+    // progress surface) owns this output, and the card is the job's, not a
+    // streaming preview of a call that is over.
+    if (backgroundJob) {
+      appendPwshJobOutput(backgroundJob, chunk);
+      for (const sink of progressSinks) sink(backgroundJob.output);
+      return;
+    }
+    if (autoBg) {
+      backgroundOutput = (backgroundOutput + chunk).slice(
+        -MAX_JOB_OUTPUT_CHARS,
+      );
+      for (const sink of progressSinks) sink(backgroundOutput);
+    }
+    if (format !== "text") return;
+    streamPreview = (streamPreview + chunk).slice(-STREAM_PREVIEW_CHARS);
+    onUpdate?.({
+      content: [{ type: "text", text: streamPreview }],
+      details: {
+        cwd,
+        sessionKey,
+        format,
+        timeoutSec,
+        streaming: true,
+        output: streamPreview,
+        wallTimeMs: Date.now() - started,
+      },
+    });
+  };
+
+  // The stateless mode's counterpart to the process that bash retires when a
+  // command ends: once the run has settled, its session (and whatever children
+  // it left behind) is dropped. The result is already captured, so this cannot
+  // race the fold or the foreground formatting.
+  const runPromise = session
+    .run(
+      {
+        code: command,
+        env: params.env,
+        width,
+        format,
+      },
+      {
+        timeoutMs,
+        signal: autoBg ? runController.signal : signal,
+        // JSON output is never previewed, but an auto-backgrounded call still
+        // accumulates it for the job record it may become.
+        onChunk: autoBg || format === "text" ? onChunk : undefined,
+      },
+    )
+    .then(
+      (res) => {
+        if (stateless) api.dispose(sessionKey);
+        return res;
+      },
+      (error: unknown) => {
+        if (stateless) api.dispose(sessionKey);
+        throw error;
+      },
+    );
+
+  if (autoBg) {
+    // This continuation outlives the tool call once the command backgrounds:
+    // folding the outcome into the record is what its delivery reports.
+    void runPromise.then(
+      (res) => {
+        const job = backgroundJob;
+        if (!job) return;
+        finishPwshJob(job, res, runController.signal.aborted);
+        job.endTime = Date.now();
+        backgroundSettled.resolve(job);
+      },
+      // `session.run` resolves rather than rejecting, but a record must settle
+      // either way: a job stuck on `running` would never deliver its result.
+      (error: unknown) => {
+        const job = backgroundJob;
+        if (!job) return;
+        job.status = "failed";
+        job.error = error instanceof Error ? error.message : String(error);
+        job.endTime = Date.now();
+        backgroundSettled.resolve(job);
+      },
+    );
+
+    const waitMs = resolveAutoBackgroundWaitMs(autoBg.thresholdMs, timeoutMs);
+    const waited = await raceForegroundWait(runPromise, waitMs, signal);
+    if (waited.outcome === "threshold" || waited.outcome === "steer") {
+      let job: PwshJob | undefined;
+      try {
+        job = autoBg.runtime.adoptJob({
+          command,
+          cwd,
+          sessionKey,
+          startTime: started,
+          output: backgroundOutput,
+          timeoutSec,
+          intent: params.i,
+          resolveIntent: autoBg.resolveIntent,
+          abortController: runController,
+          settled: backgroundSettled.promise,
+          onProgress: (sink) => {
+            progressSinks.add(sink);
+            return () => {
+              progressSinks.delete(sink);
+            };
+          },
+        });
+      } catch (err) {
+        // An adoption failure must never lose the command: fall through to the
+        // full foreground wait below.
+        job = undefined;
+      }
+      if (job) {
+        backgroundJob = job;
+        // Past adoption the runtime owns cancellation (`kill`, session
+        // teardown): a later turn abort must not kill a background command.
+        unbridgeAbort();
+        details.wallTimeMs = Date.now() - started;
+        return {
+          text: autoBackgroundedText(job, waited.outcome === "steer"),
+          details: jobDetails(job, params, cwd, ""),
+        };
+      }
+    }
+    if (waited.outcome === "aborted" && !runController.signal.aborted) {
+      runController.abort(signal?.reason);
+    }
+  }
+
+  const runResult = await runPromise;
+  unbridgeAbort();
 
   const wallTimeMs = Date.now() - started;
   details.wallTimeMs = wallTimeMs;
@@ -341,8 +547,9 @@ export async function runPwsh(
   }
   if (runResult.aborted) {
     details.output = runResult.partialOutput;
+    // The loop's own steering/IRC reason, from the global symbol registry.
     const isMessageInterruption =
-      signal?.reason === Symbol.for("pi-agent-core.tool-interrupt");
+      signal?.reason === TOOL_INTERRUPT_ABORT_REASON;
     const msg = isMessageInterruption
       ? "Command interrupted by message."
       : "Command cancelled.";
@@ -373,9 +580,11 @@ export async function runPwsh(
   const notices: string[] = [];
   if (params.restart) {
     notices.push(
-      previousPid == null
-        ? `Session restarted (pid ${session.pid})`
-        : `Session restarted (pid ${previousPid} → ${session.pid})`,
+      stateless
+        ? `Fresh session (pid ${session.pid}); pwsh.autoBackground.enabled starts every call in its own process, so there was nothing to restart`
+        : previousPid == null
+          ? `Session restarted (pid ${session.pid})`
+          : `Session restarted (pid ${previousPid} → ${session.pid})`,
     );
   }
   if (resp?.exitCode !== null && resp?.exitCode !== undefined) {
@@ -445,6 +654,28 @@ function hostWaitText(job: PwshJob): string {
 function normalizeWidth(value: number | undefined): number {
   if (value === undefined) return DEFAULT_WIDTH;
   return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(value)));
+}
+
+/**
+ * LLM-facing body for a call that auto-backgrounded. States the job's kill
+ * deadline (already partly spent: the deadline counts the whole run) and that
+ * the command is on its own now — in auto-background mode every call owns a
+ * process, so a later call neither waits for this job nor shares its state.
+ */
+function autoBackgroundedText(job: PwshJob, steered: boolean): string {
+  const deadline =
+    job.timeoutSec > 0
+      ? ` (killed once it has run ${job.timeoutSec}s in total; \`timeout: 0\` disables the deadline)`
+      : " (no deadline)";
+  return [
+    steered
+      ? "Backgrounded early to handle an incoming message; the command keeps running."
+      : undefined,
+    `Backgrounded as job ${job.id}${deadline}; it keeps running in its own PowerShell process and its output is delivered as a follow-up when it finishes. Do NOT poll for it (no \`sleep\`/retry loops, log tailing): every poll is a wasted turn — do other work, or end your reply and wait to be woken.`,
+    `Inspect with { jobId: "${job.id}" }, wait with { jobId: "${job.id}", action: "wait" }, or stop with { jobId: "${job.id}", action: "kill" }.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /** Details payload shared by job-control, status, and wait results. */
@@ -567,14 +798,75 @@ function installJobsUi(pi: ExtensionAPI): void {
     });
   }
   if (typeof pi.registerCommand === "function") {
+    // `/pwsh` is both the jobs listing and the tool's settings surface: the
+    // `/settings` panel cannot show settings an extension registered (see
+    // `command.ts`), so the mode switch and the threshold are edited here.
     pi.registerCommand("pwsh", {
-      description: "List PowerShell background jobs",
-      handler: async (_args: string, ctx: ExtensionContext) => {
+      description:
+        "List PowerShell background jobs, or configure the tool (/pwsh mode on|off, /pwsh threshold 30s)",
+      getArgumentCompletions: (prefix: string) =>
+        pwshArgumentCompletions(prefix ?? ""),
+      handler: async (args: string, ctx: ExtensionContext) => {
         refreshJobsStatus(ctx);
-        ctx.ui.notify(
-          jobsReport(getJobManager(undefined, ctx).listJobs()),
-          "info",
-        );
+        const command = parsePwshCommand(args ?? "");
+        const scope = settingsScopeOf(pi);
+        const notify = (text: string) => ctx.ui.notify(text, "info");
+        switch (command.kind) {
+          case "jobs":
+            notify(jobsReport(getJobManager(undefined, ctx).listJobs()));
+            return;
+          case "help":
+            notify(PWSH_COMMAND_USAGE);
+            return;
+          case "showMode":
+          case "setMode": {
+            if (
+              command.kind === "setMode" &&
+              !setAutoBackgroundEnabled(scope, command.enabled)
+            ) {
+              notify(SETTINGS_UNAVAILABLE_TEXT);
+              return;
+            }
+            // Read back rather than echoing the argument, so the report shows
+            // what the layers resolved (a project config can still outrank the
+            // global write).
+            notify(
+              formatModeReport(describeAutoBackground(scope)) +
+                (command.kind === "setMode"
+                  ? `\n${DESCRIPTION_REFRESH_NOTE}`
+                  : ""),
+            );
+            return;
+          }
+          case "showThreshold":
+          case "setThreshold":
+          case "resetThreshold": {
+            if (
+              command.kind !== "showThreshold" &&
+              !setAutoBackgroundThresholdMs(
+                scope,
+                command.kind === "setThreshold"
+                  ? command.thresholdMs
+                  : undefined,
+              )
+            ) {
+              notify(SETTINGS_UNAVAILABLE_TEXT);
+              return;
+            }
+            notify(
+              formatThresholdReport(describeAutoBackground(scope)) +
+                (command.kind === "showThreshold"
+                  ? ""
+                  : `\n${DESCRIPTION_REFRESH_NOTE}`),
+            );
+            return;
+          }
+          case "unknown":
+            notify(
+              `Unknown /pwsh argument '${command.token}'.\n\n${PWSH_COMMAND_USAGE}`,
+            );
+            return;
+        }
       },
     });
   }
@@ -584,11 +876,23 @@ export function definePwshTool(pi: ExtensionAPI) {
   // Ensure the background job manager is initialized and bound to the host ExtensionAPI.
   installJobsUi(pi);
   const z = pi.zod;
+  // The effective settings instance carrying every config layer. Read once here
+  // for the description, and per call for the switch itself, so a config edit
+  // (or a settings-panel toggle) applies without reloading the extension. A
+  // test stub without `pi.pi` reports the documented defaults.
+  const settingsScope = settingsScopeOf(pi);
+  const initialAutoBackground = readAutoBackgroundSettings(settingsScope);
   return {
     name: "pwsh",
     label: TOOL_LABEL,
-    description:
-      "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats. Set restart:true to rebuild the session first (drops its state and releases file locks held by loaded assemblies).",
+    description: initialAutoBackground.enabled
+      ? // The switch means "bash mode": with it on, this tool is stateless the
+        // same way the built-in bash tool is, which is what lets a call
+        // background without holding anything a later call needs.
+        "Execute PowerShell 7 commands, one fresh session per call (pwsh.autoBackground.enabled, the bash-like mode): nothing (variables, modules, location) persists between calls, so write self-contained commands — and a command still running after " +
+        `${Math.round(initialAutoBackground.thresholdMs / 1000)}s (or 1s before \`timeout\`, if sooner) moves to a background job that keeps running in its own process, its output arriving as a follow-up. ` +
+        "`session` and `restart` have no effect in this mode. Supports text (Out-String) and JSON (ConvertTo-Json) output formats."
+      : "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats. Set restart:true to rebuild the session first (drops its state and releases file locks held by loaded assemblies).",
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
     loadMode: "essential" as const,
     // Merge call+result into one frame like built-in tools: the pending call
@@ -596,6 +900,13 @@ export function definePwshTool(pi: ExtensionAPI) {
     // as the full frame (status title + command + output). Read by
     // ToolExecutionComponent via the wrapper proxy (tool-execution.ts:1012).
     mergeCallAndResult: true as boolean,
+    // Auto-backgrounding also makes the call steerable: an incoming message must
+    // be able to detach a running command instead of waiting it out (bash does
+    // this through the host's steering signal, which extension tools cannot see,
+    // so the interruptible signal is the equivalent). Resolved per call from the
+    // live setting, so switching auto-background off restores plain foreground
+    // semantics — a queued message then waits for the command as it always did.
+    interruptible: () => readAutoBackgroundSettings(settingsScope).enabled,
     parameters: z.object({
       i: z
         .string()
@@ -652,12 +963,14 @@ export function definePwshTool(pi: ExtensionAPI) {
       session: z
         .string()
         .optional()
-        .describe("custom session name to isolate the process pool"),
+        .describe(
+          "custom session name to isolate the process pool; ignored while pwsh.autoBackground.enabled is on, where every call already gets its own process",
+        ),
       restart: z
         .boolean()
         .optional()
         .describe(
-          "restart the persistent session for this cwd/session: the old pwsh process tree is killed - releasing file locks held by loaded assemblies (e.g. an Add-Type output file) and aborting any command still running on that session - and a fresh empty one starts; with command the command then runs in the fresh session, without one the call only restarts",
+          "restart the persistent session for this cwd/session: the old pwsh process tree is killed - releasing file locks held by loaded assemblies (e.g. an Add-Type output file) and aborting any command still running on that session - and a fresh empty one starts; with command the command then runs in the fresh session, without one the call only restarts; unnecessary while pwsh.autoBackground.enabled is on, where every call already runs in a fresh process",
         ),
     }),
     async execute(
@@ -801,7 +1114,15 @@ export function definePwshTool(pi: ExtensionAPI) {
       }
 
       // Branch 3: Synchronous foreground execution
-      const out = await runPwsh(params, pool, onUpdate, signal);
+      // The auto-background policy is read per call so a live config edit (or a
+      // settings-panel toggle) takes effect on the next command.
+      const out = await runPwsh(params, pool, onUpdate, signal, {
+        ...readAutoBackgroundSettings(settingsScope),
+        runtime: jm,
+        // `i` is stripped from the parameters before `execute` runs (intent
+        // tracing), so the adopted job's label is resolved by call id.
+        resolveIntent: () => intentsByCallId.get(toolCallId),
+      });
       return toolText(out.text, out.details, out.isError);
     },
     onSession(event: { reason: string }, ctx?: ExtensionContext): void {

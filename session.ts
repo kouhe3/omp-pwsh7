@@ -371,7 +371,8 @@ export class PwshSession {
       let frame: PwshResponse | PwshChunk;
       try {
         frame = JSON.parse(Buffer.from(line, "base64").toString("utf8")) as
-          PwshResponse | PwshChunk;
+          | PwshResponse
+          | PwshChunk;
       } catch {
         continue; // garbage line (e.g. startup noise) - ignore
       }

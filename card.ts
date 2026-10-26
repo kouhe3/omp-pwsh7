@@ -489,7 +489,8 @@ export function commandBlock(
     lines = source.split("\n");
   }
   // A trailing newline in the submitted command is not a command line.
-  while (lines.length > 1 && lines[lines.length - 1]!.trim() === "") lines.pop();
+  while (lines.length > 1 && lines[lines.length - 1]!.trim() === "")
+    lines.pop();
   const visibleCount = expanded
     ? lines.length
     : Math.min(lines.length, COMMAND_PREVIEW_LINES);
