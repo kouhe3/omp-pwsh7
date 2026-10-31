@@ -158,7 +158,7 @@ export function pwshArgumentCompletions(
 }
 
 const STATELESS_MODE_TEXT =
-  "pwsh mode: stateless (bash-style) — every call runs in its own fresh session, so variables, modules, and location do not persist; a call that outstays the threshold moves to a background job.";
+  "pwsh mode: stateless (bash-style) — every call runs in its own fresh session, so variables, modules, and location do not persist; a call that outstays the threshold moves to a background job; a process it detaches with Start-Process keeps running.";
 const PERSISTENT_MODE_TEXT =
   "pwsh mode: persistent — one session keeps variables, modules, and location across calls; long-running calls are never auto-backgrounded.";
 

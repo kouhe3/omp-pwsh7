@@ -135,8 +135,12 @@ interface PwshApi {
   getOrCreate(key: string, cwd?: string): SessionLike;
   /** Kill and rebuild the session for `key`, returning the fresh one. */
   restart(key: string, cwd?: string): Promise<SessionLike>;
-  /** Drop a pooled session (kills its process tree); used by the stateless mode. */
-  dispose(key: string): void;
+  /**
+   * Drop a pooled session. `tree` (the default) kills its whole process tree;
+   * `{ tree: false }` retires the runner and detaches its children, which is
+   * what the stateless mode does once a command has finished.
+   */
+  dispose(key: string, options?: { tree?: boolean }): void;
   /** Live pid(s) of the pooled session for `key`; empty when it has none. */
   pidFor(key: string): readonly number[];
 }
@@ -410,10 +414,12 @@ export async function runPwsh(
     });
   };
 
-  // The stateless mode's counterpart to the process that bash retires when a
-  // command ends: once the run has settled, its session (and whatever children
-  // it left behind) is dropped. The result is already captured, so this cannot
-  // race the fold or the foreground formatting.
+  // The stateless mode's counterpart to the shell bash retires when a command
+  // ends: once the run has settled, its runner is retired — but only the
+  // runner. A child the command detached (`Start-Process`) is orphaned alive,
+  // exactly as after a bash call; a cancel or a timeout already killed its tree
+  // in `session.run`. The result is already captured, so this cannot race the
+  // fold or the foreground formatting.
   const runPromise = session
     .run(
       {
@@ -432,11 +438,11 @@ export async function runPwsh(
     )
     .then(
       (res) => {
-        if (stateless) api.dispose(sessionKey);
+        if (stateless) api.dispose(sessionKey, { tree: false });
         return res;
       },
       (error: unknown) => {
-        if (stateless) api.dispose(sessionKey);
+        if (stateless) api.dispose(sessionKey, { tree: false });
         throw error;
       },
     );
@@ -889,9 +895,9 @@ export function definePwshTool(pi: ExtensionAPI) {
       ? // The switch means "bash mode": with it on, this tool is stateless the
         // same way the built-in bash tool is, which is what lets a call
         // background without holding anything a later call needs.
-        "Execute PowerShell 7 commands, one fresh session per call (pwsh.autoBackground.enabled, the bash-like mode): nothing (variables, modules, location) persists between calls, so write self-contained commands — and a command still running after " +
+        "Execute PowerShell 7 commands, one fresh session per call (pwsh.autoBackground.enabled, the bash-like mode): nothing (variables, modules, location) persists between calls, so write self-contained commands. The session's runner exits when the command settles, but a process it detaches with `Start-Process` keeps running, as it would after a bash call; its output is not captured, so run work whose output matters as the command itself (let it auto-background, or pass `async: true`). A command still running after " +
         `${Math.round(initialAutoBackground.thresholdMs / 1000)}s (or 1s before \`timeout\`, if sooner) moves to a background job that keeps running in its own process, its output arriving as a follow-up. ` +
-        "`session` and `restart` have no effect in this mode. Supports text (Out-String) and JSON (ConvertTo-Json) output formats."
+        "A timeout or a `kill` cancels the whole process tree instead. `session` and `restart` have no effect in this mode. Supports text (Out-String) and JSON (ConvertTo-Json) output formats."
       : "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats. Set restart:true to rebuild the session first (drops its state and releases file locks held by loaded assemblies).",
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
     loadMode: "essential" as const,

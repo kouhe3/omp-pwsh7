@@ -758,6 +758,163 @@ test("returns streamed output when a command times out", async () => {
   }
 });
 
+/**
+ * Liveness by pid through `tasklist`: a dead pid matches no row. Real OS
+ * processes, so this is the one place a bounded wait is unavoidable —
+ * `taskkill` reports success once the target is terminated, but nothing exposes
+ * an event for a pid the extension no longer owns.
+ */
+async function pidAlive(pid: number): Promise<boolean> {
+  const proc = Bun.spawn(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+    windowsHide: true,
+  });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return out.includes(String(pid));
+}
+
+async function waitForPid(
+  pid: number,
+  alive: boolean,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if ((await pidAlive(pid)) === alive) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(100);
+  }
+}
+
+/** Kill a test-started child so a failing assertion cannot leak a process. */
+async function killPid(pid: number): Promise<void> {
+  const proc = Bun.spawn(["taskkill", "/PID", String(pid), "/T", "/F"], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    windowsHide: true,
+  });
+  await proc.exited;
+}
+
+const START_SLEEPER =
+  "Start-Process pwsh -ArgumentList '-NoProfile','-Command','Start-Sleep 45' -PassThru -WindowStyle Hidden";
+
+test("disposing without a tree retires the runner and detaches its children", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `detach-dispose-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      {
+        code: `$p = ${START_SLEEPER}; "runner=$PID child=$($p.Id)"`,
+      },
+      { timeoutMs: 30_000 },
+    );
+    const [, runnerPid, parsed] =
+      /runner=(\d+) child=(\d+)/.exec(res.response?.output ?? "") ?? [];
+    childPid = Number(parsed);
+    expect(childPid).toBeGreaterThan(0);
+
+    // `dispose` settles the runner, so the runner is checked without a wait;
+    // the child is what must still be there afterwards.
+    await session.dispose({ tree: false });
+    expect(await pidAlive(Number(runnerPid))).toBe(false);
+    expect(await pidAlive(childPid)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("the default dispose still kills a Start-Process child", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `tree-dispose-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      { code: `(${START_SLEEPER}).Id` },
+      { timeoutMs: 30_000 },
+    );
+    childPid = Number(res.response?.output?.trim());
+    expect(childPid).toBeGreaterThan(0);
+
+    // Cancel, restart, and shutdown all take the tree: the child dies with it.
+    await session.dispose();
+    expect(await waitForPid(childPid, false)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("a timeout cancels the whole tree, detached child included", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `timeout-tree-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      { code: `$p = ${START_SLEEPER}; "child=$($p.Id)"; Start-Sleep 30` },
+      { timeoutMs: 3_000 },
+    );
+    childPid = Number(/child=(\d+)/.exec(res.partialOutput ?? "")?.[1]);
+    expect(res.timedOut).toBe(true);
+    expect(childPid).toBeGreaterThan(0);
+
+    // Detachment only applies to commands that finished: a cancel still takes
+    // the tree, so nothing a timed-out command started survives it.
+    expect(await waitForPid(childPid, false)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("a finished stateless call leaves its Start-Process child running", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const result = await runPwsh(
+      { command: `$p = ${START_SLEEPER}; "child=$($p.Id)"` },
+      pool,
+      undefined,
+      undefined,
+      { enabled: true, thresholdMs: 60_000 },
+    );
+    childPid = Number(/child=(\d+)/.exec(result.text)?.[1]);
+    expect(result.isError ?? false).toBe(false);
+    expect(childPid).toBeGreaterThan(0);
+
+    // The call retired its runner (the pool entry is gone) but the detached
+    // child is alive — the bash `&` contract.
+    expect(pool.pidFor(result.details.sessionKey)).toEqual([]);
+    expect(await pidAlive(childPid)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
 test("wraps long output without replacing its tail with an ellipsis", () => {
   const output = JSON.stringify({
     Name: "root",

@@ -213,7 +213,11 @@ export async function runPwshJob(
     }
   } finally {
     job.endTime = Date.now();
-    pool.dispose(job.sessionKey);
+    // Settlement retires the runner; it does not cancel. A cancel or a timeout
+    // already killed the tree inside `session.run`, so a process the finished
+    // command deliberately detached must survive — the same rule the stateless
+    // foreground path follows.
+    pool.dispose(job.sessionKey, { tree: false });
   }
 }
 

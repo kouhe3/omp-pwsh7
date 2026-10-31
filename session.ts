@@ -98,6 +98,16 @@ export class PwshSession {
   /** Set by dispose(); reported to requests it settles, cleared on restart. */
   #disposeReason: string | undefined;
   #stderrTail = "";
+  /**
+   * The `taskkill /T` a cancel (timeout/abort) issued for the live process.
+   * A dispose arriving while it runs must wait for it instead of killing the
+   * runner itself: killing the root first makes the tree walk find nothing,
+   * which would orphan exactly the children the cancel meant to take.
+   */
+  #treeKill: {
+    proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+    done: Promise<void>;
+  } | undefined;
 
   constructor(
     key: string,
@@ -150,6 +160,8 @@ export class PwshSession {
     this.#proc = proc;
     this.#dead = false;
     this.#disposeReason = undefined;
+    // A respawned process has no kill in flight.
+    this.#treeKill = undefined;
     // Bun's onStdout/onStderr spawn options never fire (Bun 1.3.14,
     // Windows) - read the piped streams manually instead.
     if (proc.stdout)
@@ -287,7 +299,12 @@ export class PwshSession {
           windowsHide: true,
         },
       );
-      killer.exited.finally(() => {
+      const done = killer.exited.then(() => undefined);
+      // Recorded before the walk can finish: a dispose that lands in this window
+      // (the stateless settle path runs the moment the run resolves) waits for
+      // this kill instead of preempting it.
+      this.#treeKill = { proc: live, done };
+      done.finally(() => {
         if (this.#proc === live) this.#proc = null;
       });
       // Fallback: direct kill if taskkill fails to deliver within grace.
@@ -407,8 +424,17 @@ export class PwshSession {
     return live && !live.killed ? live.pid : undefined;
   }
 
-  /** Dispose: kill the process tree and drop the session. */
-  async dispose(): Promise<void> {
+  /**
+   * Dispose: retire the runner and drop the session.
+   *
+   * `tree` (the default) kills the runner's whole live process tree with it —
+   * what a cancel, a restart, or shutdown needs. `tree: false` terminates only
+   * the runner and leaves its children running: a command that finished has
+   * not cancelled anything, and a process it detached (`Start-Process`, the
+   * cmdlet Windows hands independence to) must survive the shell, as it does
+   * after a bash call.
+   */
+  async dispose(options: { tree?: boolean } = {}): Promise<void> {
     const live = this.#proc;
     // Settle anything in flight *before* dropping #proc: start()'s exit handler
     // ignores exits from a superseded process, so requests left in #pending
@@ -420,19 +446,40 @@ export class PwshSession {
     this.#rejectAll(new Error(DISPOSE_REASON));
     this.#proc = null;
     if (live && live.pid != null && !live.killed) {
-      const killer = Bun.spawn(
-        ["taskkill", "/PID", String(live.pid), "/T", "/F"],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          windowsHide: true,
-        },
-      );
-      await new Promise<void>((res) => {
-        killer.exited.finally(res);
-        setTimeout(res, KILL_GRACE_MS).unref();
-      });
+      const pendingTreeKill =
+        this.#treeKill?.proc === live ? this.#treeKill.done : undefined;
+      if (pendingTreeKill) {
+        // A cancel already issued the `/T` for this process. A second kill from
+        // here — even another `/T` — can terminate the root before that walk
+        // starts, and the walk then finds nothing; waiting is what keeps a
+        // timed-out command's children dead.
+        await pendingTreeKill.catch(() => {});
+      } else if (options.tree === false) {
+        // No `/T`: the runner dies alone, its children are orphaned alive.
+        try {
+          live.kill();
+        } catch {
+          /* already gone */
+        }
+        // Settled, not fire-and-forget: a caller that awaited this dispose can
+        // rely on the runner being gone.
+        await live.exited.catch(() => {});
+      } else {
+        const killer = Bun.spawn(
+          ["taskkill", "/PID", String(live.pid), "/T", "/F"],
+          {
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+            windowsHide: true,
+          },
+        );
+        const { promise: settled, resolve: settle } =
+          Promise.withResolvers<void>();
+        killer.exited.finally(settle);
+        setTimeout(settle, KILL_GRACE_MS).unref();
+        await settled;
+      }
     }
     this.#dead = true;
   }
@@ -485,11 +532,11 @@ export class PwshSessionPool {
     session.start();
     return session;
   }
-  dispose(key: string): void {
+  dispose(key: string, options?: { tree?: boolean }): void {
     const s = this.#sessions.get(key);
     if (s) {
       this.#sessions.delete(key);
-      void s.dispose();
+      void s.dispose(options);
     }
   }
 
