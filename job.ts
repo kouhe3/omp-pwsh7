@@ -40,6 +40,14 @@ export interface PwshJob {
   exitCode?: number | null;
   output: string;
   outputTruncated?: boolean;
+  /**
+   * Total output characters received. `output` is a bounded tail of it, so
+   * this is the only honest progress signal for a job producing more than
+   * {@link MAX_JOB_OUTPUT_CHARS}.
+   */
+  outputChars?: number;
+  /** When output last arrived; absent while the job has produced none. */
+  lastOutputAt?: number;
   error?: string | null;
   intent?: string;
   /**
@@ -100,6 +108,8 @@ export interface PwshJobsRuntime {
   readonly resultDelivery: "self" | "host";
   setJobsChangedListener(listener: (() => void) | undefined): void;
   listJobs(): readonly PwshJob[];
+  /** Live pids of a job's process(es); empty once its session is gone. */
+  pidsFor(job: PwshJob): readonly number[];
   getJob(id: string): PwshJob | undefined;
   startJob(options: StartJobOptions): PwshJob;
   /**
@@ -127,42 +137,54 @@ export function finishPwshJob(
   res: PwshRunResult,
   aborted: boolean,
 ): void {
-  if (aborted || job.status === "killed") {
-    job.status = "killed";
-    if (!job.output && res.partialOutput) job.output = res.partialOutput;
-    return;
-  }
-  if (res.timedOut) {
-    job.status = "failed";
-    job.error = "Command timed out.";
-    if (!job.output && res.partialOutput) job.output = res.partialOutput;
-    return;
-  }
-  if (res.dead || res.error) {
-    job.status = "failed";
-    job.error = res.error ?? "Subprocess failed.";
-    if (!job.output && res.partialOutput) job.output = res.partialOutput;
-    return;
-  }
-  const resp = res.response;
-  job.exitCode = resp?.exitCode;
-  if (resp?.output && !job.output) {
-    if (resp.output.length > MAX_JOB_OUTPUT_CHARS) {
-      job.output = resp.output.slice(-MAX_JOB_OUTPUT_CHARS);
-      job.outputTruncated = true;
-    } else {
-      job.output = resp.output;
+  try {
+    if (aborted || job.status === "killed") {
+      job.status = "killed";
+      if (!job.output && res.partialOutput) job.output = res.partialOutput;
+      return;
+    }
+    if (res.timedOut) {
+      job.status = "failed";
+      job.error = "Command timed out.";
+      if (!job.output && res.partialOutput) job.output = res.partialOutput;
+      return;
+    }
+    if (res.dead || res.error) {
+      job.status = "failed";
+      job.error = res.error ?? "Subprocess failed.";
+      if (!job.output && res.partialOutput) job.output = res.partialOutput;
+      return;
+    }
+    const resp = res.response;
+    job.exitCode = resp?.exitCode;
+    if (resp?.output && !job.output) {
+      if (resp.output.length > MAX_JOB_OUTPUT_CHARS) {
+        job.output = resp.output.slice(-MAX_JOB_OUTPUT_CHARS);
+        job.outputTruncated = true;
+      } else {
+        job.output = resp.output;
+      }
+    }
+    if (resp?.error) job.error = resp.error;
+    const hasError = Boolean(
+      job.error || (job.exitCode != null && job.exitCode !== 0),
+    );
+    job.status = hasError ? "failed" : "completed";
+  } finally {
+    // A run that never streamed still produced output: seed the progress
+    // counters from the final payload so `status` can tell "finished with
+    // output" from "never said anything".
+    if (job.outputChars == null) job.outputChars = job.output.length;
+    if (job.lastOutputAt == null && job.output.length > 0) {
+      job.lastOutputAt = Date.now();
     }
   }
-  if (resp?.error) job.error = resp.error;
-  const hasError = Boolean(
-    job.error || (job.exitCode != null && job.exitCode !== 0),
-  );
-  job.status = hasError ? "failed" : "completed";
 }
 
 /** Append streamed output to a job, keeping the retained tail window bounded. */
 export function appendPwshJobOutput(job: PwshJob, chunk: string): void {
+  job.outputChars = (job.outputChars ?? job.output.length) + chunk.length;
+  job.lastOutputAt = Date.now();
   if (job.output.length + chunk.length > MAX_JOB_OUTPUT_CHARS) {
     job.output = (job.output + chunk).slice(-MAX_JOB_OUTPUT_CHARS);
     job.outputTruncated = true;
@@ -319,22 +341,45 @@ export function jobResultText(job: PwshJob, maxChars?: number): string {
     .join("\n");
 }
 
-/** One listing row: marker, id, status, elapsed time, clamped label. */
-function jobRow(job: PwshJob, now: number): string {
+/** Compact character count, so a chatty job cannot widen the listing. */
+function formatJobOutputChars(job: PwshJob): string {
+  const chars = job.outputChars ?? job.output.length;
+  if (chars < 1000) return `${chars} chars`;
+  if (chars < 1_000_000) return `${(chars / 1000).toFixed(1)}k chars`;
+  return `${(chars / 1_000_000).toFixed(1)}M chars`;
+}
+
+/**
+ * One listing row: marker, id, status, elapsed time, live pid, output progress,
+ * clamped label. The pid is what lets a caller correlate the job with an OS
+ * process without guessing (`Get-Process -Id`), and output progress separates a
+ * silently working job from a dead one.
+ */
+function jobRow(job: PwshJob, now: number, pids: readonly number[]): string {
   const label = jobLabel(job).replace(/\s+/g, " ");
   const shown =
     label.length > JOB_LABEL_CHARS
       ? `${label.slice(0, JOB_LABEL_CHARS - 3)}...`
       : label;
   const elapsed = (job.endTime ?? now) - job.startTime;
-  return `  ${JOB_MARKERS[job.status]} ${job.id} ${job.status} ${formatJobDuration(elapsed)} — ${shown}`;
+  const facts = [formatJobDuration(elapsed), `out ${formatJobOutputChars(job)}`];
+  if (pids.length > 0) facts.splice(1, 0, `pid ${pids.join(",")}`);
+  if (job.status === "running" && job.lastOutputAt != null) {
+    facts.push(`last ${formatJobDuration(now - job.lastOutputAt)} ago`);
+  }
+  return `  ${JOB_MARKERS[job.status]} ${job.id} ${job.status} ${facts.join(" · ")} — ${shown}`;
 }
 
 /**
  * `/pwsh` listing: running jobs first, then the most recently settled ones.
- * One row per job — marker, id, elapsed time, label.
+ * One row per job — marker, id, elapsed time, live pid, output progress, label.
+ * `pidsFor` is optional so pure formatting (tests, snapshots) needs no pool.
  */
-export function jobsReport(jobs: readonly PwshJob[], now = Date.now()): string {
+export function jobsReport(
+  jobs: readonly PwshJob[],
+  now = Date.now(),
+  pidsFor?: (job: PwshJob) => readonly number[],
+): string {
   if (jobs.length === 0) {
     return 'No PowerShell background jobs. Start one with pwsh { command: "…", async: true }.';
   }
@@ -343,8 +388,16 @@ export function jobsReport(jobs: readonly PwshJob[], now = Date.now()): string {
     .filter((job) => job.status !== "running")
     .sort((a, b) => (b.endTime ?? 0) - (a.endTime ?? 0))
     .slice(0, RECENT_JOB_ROWS);
-  const lines = [`PowerShell jobs — ${running.length} running`];
-  for (const job of [...running, ...settled]) lines.push(jobRow(job, now));
+  const settledTotal = jobs.length - running.length;
+  const lines = [
+    `PowerShell jobs — ${running.length} running` +
+      (settledTotal > 0 ? ` · ${settledTotal} settled retained` : ""),
+  ];
+  for (const job of [...running, ...settled]) {
+    lines.push(jobRow(job, now, pidsFor?.(job) ?? []));
+  }
+  const hidden = settledTotal - settled.length;
+  if (hidden > 0) lines.push(`  … ${hidden} older settled job(s) not shown`);
   return lines.join("\n");
 }
 
@@ -386,6 +439,10 @@ export class PwshJobManager implements PwshJobsRuntime {
 
   listJobs(): PwshJob[] {
     return Array.from(this.#jobs.values());
+  }
+
+  pidsFor(job: PwshJob): readonly number[] {
+    return this.#pool.pidFor(job.sessionKey);
   }
 
   startJob(options: StartJobOptions): PwshJob {

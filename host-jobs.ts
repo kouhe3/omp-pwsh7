@@ -117,6 +117,10 @@ export class HostPwshJobs implements PwshJobsRuntime {
     return Array.from(this.#jobs.values());
   }
 
+  pidsFor(job: PwshJob): readonly number[] {
+    return this.#pool.pidFor(job.sessionKey);
+  }
+
   startJob(options: StartJobOptions): PwshJob {
     const controller = new AbortController();
     // One pooled session per job, disposed on settle — the same isolation the

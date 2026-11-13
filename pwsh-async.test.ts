@@ -9,7 +9,9 @@ import {
 import {
   MAX_RETAINED_SETTLED_JOBS,
   PwshJobManager,
+  appendPwshJobOutput,
   jobLabel,
+  jobsReport,
   type PwshJob,
 } from "./job";
 import { PwshSessionPool } from "./session";
@@ -1099,4 +1101,101 @@ test("job labels strip control sequences from a declared intent too", () => {
   } as unknown as PwshJob;
 
   expect(jobLabel(job)).toBe("Dothing");
+});
+
+test("jobsReport shows the live pid, output progress, and last-output age", () => {
+  const now = 1_000_000;
+  const running = {
+    id: "pwsh_run",
+    command: "python pull.py",
+    status: "running",
+    startTime: now - 12_400,
+    timeoutSec: 0,
+    output: "",
+    outputChars: 1234,
+    lastOutputAt: now - 2_000,
+  } as unknown as PwshJob;
+  const settled = {
+    id: "pwsh_done",
+    command: "Write-Output hi",
+    status: "completed",
+    startTime: now - 9_000,
+    endTime: now - 2_500,
+    exitCode: 0,
+    timeoutSec: 120,
+    output: "hi",
+    outputChars: 2,
+  } as unknown as PwshJob;
+
+  const report = jobsReport([running, settled], now, (job) =>
+    job.id === "pwsh_run" ? [4242] : [],
+  );
+  expect(report).toContain("1 running · 1 settled retained");
+  expect(report).toContain(
+    "pwsh_run running 12.4s · pid 4242 · out 1.2k chars · last 2.0s ago — python pull.py",
+  );
+  // A settled job has no live process, so no pid segment.
+  expect(report).toContain(
+    "pwsh_done completed 6.5s · out 2 chars — Write-Output hi",
+  );
+});
+
+test("streamed output tracks total characters and the last output time", () => {
+  const job = { output: "", status: "running" } as PwshJob;
+  const before = Date.now();
+
+  appendPwshJobOutput(job, "hello");
+  appendPwshJobOutput(job, " world");
+
+  expect(job.output).toBe("hello world");
+  expect(job.outputChars).toBe(11);
+  expect(job.lastOutputAt).toBeGreaterThanOrEqual(before);
+});
+
+test("action 'list' enumerates jobs without a jobId", async () => {
+  const { tool, startJob } = makeTool();
+  getJobManager().disposeAll();
+
+  const empty = await tool.execute(
+    "call_list_empty",
+    { action: "list" },
+    undefined,
+    undefined,
+  );
+  expect(empty.content[0]?.text).toContain("No PowerShell background jobs");
+
+  const { jobId } = await startJob("call_list_job", {
+    command: "Start-Sleep -Seconds 10",
+    i: "Listing probe",
+  });
+
+  const listed = await tool.execute(
+    "call_list_jobs",
+    { action: "list" },
+    undefined,
+    undefined,
+  );
+  const text = listed.content[0]?.text ?? "";
+  expect(text).toContain(jobId);
+  expect(text).toContain("running");
+  // No output yet is reported as progress, not as an empty snapshot.
+  expect(text).toContain("out 0 chars");
+  expect(text).toContain("Listing probe");
+
+  // Inspecting one job still reports its cwd, so a caller can correlate it.
+  const status = await tool.execute(
+    "call_list_status",
+    { jobId },
+    undefined,
+    undefined,
+  );
+  expect(status.content[0]?.text).toContain("cwd:");
+  expect(status.content[0]?.text).toContain("Output: none yet");
+
+  await tool.execute(
+    "call_list_kill",
+    { jobId, action: "kill" },
+    undefined,
+    undefined,
+  );
 });
