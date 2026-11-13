@@ -1123,7 +1123,7 @@ test("renders the default timeout while partial details are incomplete", () => {
     .join("\n");
 
   expect(rendered).toContain("running");
-  expect(rendered).toContain("Timeout: 120s");
+  expect(rendered).toContain("Timeout: 300s");
   expect(rendered).not.toContain("undefined");
 });
 
@@ -1416,7 +1416,7 @@ test("every frame row occupies the same number of columns", () => {
     },
   ];
   // 40 columns is narrower than the status label (`✓ completed · Wall: … |
-  // Timeout: 120s`), which is what made the divider row overflow.
+  // Timeout: 300s`), which is what made the divider row overflow.
   for (const width of [60, 40]) {
     for (const { output, intent } of cases) {
       const rows = tool

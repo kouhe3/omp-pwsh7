@@ -29,8 +29,15 @@ import {
   type Theme,
 } from "./card";
 import { PwshSessionPool, type PwshRunResult } from "./session";
-import { HostPwshJobs, hostAsyncJobs } from "./host-jobs";
 import {
+  HostPwshJobs,
+  findHostJob,
+  hostAsyncJobs,
+  hostJobHint,
+  hostJobsReport,
+} from "./host-jobs";
+import {
+  DEFAULT_TIMEOUT_SEC,
   MAX_JOB_OUTPUT_CHARS,
   PwshJobManager,
   appendPwshJobOutput,
@@ -62,7 +69,6 @@ import {
   settingsScopeOf,
 } from "./settings";
 
-const DEFAULT_TIMEOUT_SEC = 120;
 const MIN_TIMEOUT_SEC = 1;
 const MAX_TIMEOUT_SEC = 3600;
 const DEFAULT_WIDTH = 200;
@@ -71,12 +77,14 @@ const MAX_WIDTH = 4096;
 const STREAM_PREVIEW_CHARS = 50 * 1024;
 
 /**
- * Model-facing job contract, appended to both mode descriptions. The rendering
- * text is the only place a caller learns how jobs are addressed, and — more
- * importantly — that the generic `wait` tool cannot see this registry.
+ * Model-facing job contract, appended to both mode descriptions. It mirrors
+ * bash's mental model (follow-up delivery is the only wake-up path) and states
+ * the one difference the published omp host forces: this registry is private,
+ * while bash/task/eval jobs belong to the host and stay readable through
+ * `proc://`.
  */
 const JOB_SURFACE_DESCRIPTION =
-  ' Background jobs: `async: true` starts one immediately, and a call that outlives the auto-background threshold becomes one. List them with { action: "list" } (status, live pid, output progress, label), inspect one with { jobId }, block with { jobId, action: "wait" } (timeout is the wait budget), stop one with { jobId, action: "kill" }. This tool owns its job registry: the generic `wait` tool and proc:// do not see pwsh jobs, so wait through this tool.';
+  'Job control: `async: true` starts a job immediately; any call still running at the auto-background threshold moves to one. { action: "list" } lists jobs with status, live pid, and output progress; { jobId } inspects one; { jobId, action: "wait" } blocks until it settles (timeout is the wait budget); { jobId, action: "kill" } stops one. This tool owns its registry: pwsh jobs are not host jobs, so the generic `wait` tool cannot see them and they are not in proc:// — wait through this tool. Host jobs (bash/task/eval) are listed too; read proc://<id> for those.';
 
 export interface PwshParams {
   command?: string;
@@ -708,27 +716,41 @@ function normalizeWidth(value: number | undefined): number {
 }
 
 /**
- * LLM-facing body for a call that auto-backgrounded. States the job's kill
- * deadline (already partly spent: the deadline counts the whole run) and that
- * the command is on its own now — in auto-background mode every call owns a
- * process, so a later call neither waits for this job nor shares its state.
+ * Bash's `formatBackgroundNotice` sentence — same deadline phrasing, same
+ * follow-up delivery promise, same no-poll list — with the pwsh job handle and
+ * its live pid. Sharing the wording is what makes "backgrounded" mean the same
+ * thing in both shells; only the job id and the process kind differ.
+ */
+function backgroundNoticeText(job: PwshJob, pids: readonly number[]): string {
+  const deadline =
+    job.timeoutSec > 0
+      ? ` (killed once it has run ${job.timeoutSec}s in total; \`timeout: 0\` disables the deadline)`
+      : " (no deadline)";
+  const pidText = pids.length > 0 ? ` (pid ${pids.join(", ")})` : "";
+  return `Backgrounded as job ${job.id}${pidText}${deadline}; its output is injected into the conversation as a follow-up the moment it finishes. Do NOT poll for it (no \`sleep\`, \`ps\`, \`pgrep\`, \`top\`, \`pidwait\`, log tailing): every poll is a wasted turn. Do other work, or end your reply and wait to be woken.`;
+}
+
+/** The pwsh-specific control surface, appended after the shared notice. */
+function jobControlHint(jobId: string): string {
+  return `Inspect with { jobId: "${jobId}" }, wait with { jobId: "${jobId}", action: "wait" }, stop with { jobId: "${jobId}", action: "kill" }, or list every job with { action: "list" }.`;
+}
+
+/**
+ * LLM-facing body for a call that auto-backgrounded: the bash notice plus the
+ * pwsh handle. The steer prefix is pwsh-only (an incoming message detached the
+ * running command); it still reads as the same notice.
  */
 function autoBackgroundedText(
   job: PwshJob,
   steered: boolean,
   pids: readonly number[],
 ): string {
-  const deadline =
-    job.timeoutSec > 0
-      ? ` (killed once it has run ${job.timeoutSec}s in total; \`timeout: 0\` disables the deadline)`
-      : " (no deadline)";
-  const pidText = pids.length > 0 ? ` (pid ${pids.join(", ")})` : "";
   return [
     steered
       ? "Backgrounded early to handle an incoming message; the command keeps running."
       : undefined,
-    `Backgrounded as job ${job.id}${pidText}${deadline}; it keeps running in its own PowerShell process and its output is delivered as a follow-up when it finishes. Do NOT poll for it (no \`sleep\`/retry loops, log tailing): every poll is a wasted turn — do other work, or end your reply and wait to be woken.`,
-    `Inspect with { jobId: "${job.id}" }, wait with { jobId: "${job.id}", action: "wait" }, stop with { jobId: "${job.id}", action: "kill" }, or list every job with { action: "list" }.`,
+    backgroundNoticeText(job, pids),
+    jobControlHint(job.id),
   ]
     .filter(Boolean)
     .join("\n");
@@ -957,11 +979,9 @@ export function definePwshTool(pi: ExtensionAPI) {
         ? // The switch means "bash mode": with it on, this tool is stateless the
           // same way the built-in bash tool is, which is what lets a call
           // background without holding anything a later call needs.
-          "Execute PowerShell 7 commands, one fresh session per call (pwsh.autoBackground.enabled, the bash-like mode): nothing (variables, modules, location) persists between calls, so write self-contained commands. The session's runner exits when the command settles, but a process it detaches with `Start-Process` keeps running, as it would after a bash call; its output is not captured, so run work whose output matters as the command itself (let it auto-background, or pass `async: true`). A command still running after " +
-          `${Math.round(initialAutoBackground.thresholdMs / 1000)}s (or 1s before \`timeout\`, if sooner) moves to a background job that keeps running in its own process, its output arriving as a follow-up. ` +
-          "A timeout or a `kill` cancels the whole process tree instead. `session` and `restart` have no effect in this mode. Supports text (Out-String) and JSON (ConvertTo-Json) output formats."
-        : "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats. Set restart:true to rebuild the session first (drops its state and releases file locks held by loaded assemblies).") +
-      JOB_SURFACE_DESCRIPTION,
+          `Execute PowerShell 7 commands, one fresh session per call (pwsh.autoBackground.enabled, the bash-like mode): nothing (variables, modules, location) persists between calls, so write self-contained commands. A process detached with \`Start-Process\` keeps running; its output is not captured. \`async\` defers finite results but keeps the deadline (default ${DEFAULT_TIMEOUT_SEC}s); \`timeout: 0\` for watchers and long jobs. A command still running after ${Math.round(initialAutoBackground.thresholdMs / 1000)}s (or 1s before \`timeout\`, if sooner) moves to a background job that keeps running to \`timeout\`; no backgrounding when the running-job limit is reached. The result arrives automatically as a follow-up message. NEVER poll. A timeout or a \`kill\` cancels the whole process tree. \`session\` and \`restart\` have no effect in this mode.`
+        : `Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). \`async\` defers finite results but keeps the deadline (default ${DEFAULT_TIMEOUT_SEC}s); \`timeout: 0\` for watchers and long jobs. The result arrives automatically as a follow-up message. NEVER poll. Set \`restart: true\` to rebuild the session first (drops its state and releases file locks held by loaded assemblies).`) +
+      ` ${JOB_SURFACE_DESCRIPTION} Supports text (Out-String) and JSON (ConvertTo-Json) output formats.`,
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
     loadMode: "essential" as const,
     // Merge call+result into one frame like built-in tools: the pending call
@@ -993,7 +1013,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         .boolean()
         .optional()
         .describe(
-          "run command asynchronously in the background; returns immediately with jobId and delivers results automatically",
+          "defer finite results but keep the deadline; returns immediately with the job id and delivers the output as a follow-up",
         ),
       jobId: z
         .string()
@@ -1005,7 +1025,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         .enum(["status", "list", "kill", "wait"])
         .optional()
         .describe(
-          "action for background jobs: 'list' every job with status, live pid, output progress and label (no jobId needed); 'status' (default when jobId is given) to inspect one; 'kill' to stop one; 'wait' to block until it settles (timeout bounds the wait, default 120s, 0 waits indefinitely)",
+          `action for background jobs: 'list' every job with status, live pid, output progress and label (no jobId needed); 'status' (default when jobId is given) to inspect one; 'kill' to stop one; 'wait' to block until it settles (timeout bounds the wait, default ${DEFAULT_TIMEOUT_SEC}s, 0 waits indefinitely)`,
         ),
       cwd: z
         .string()
@@ -1029,7 +1049,7 @@ export function definePwshTool(pi: ExtensionAPI) {
         .number()
         .optional()
         .describe(
-          `timeout in seconds; 0 disables; default ${DEFAULT_TIMEOUT_SEC}; range ${MIN_TIMEOUT_SEC}-${MAX_TIMEOUT_SEC}`,
+          `timeout in seconds; 0 disables the command deadline; nonzero values are clamped to ${MIN_TIMEOUT_SEC}-${MAX_TIMEOUT_SEC}; default ${DEFAULT_TIMEOUT_SEC}`,
         ),
       session: z
         .string()
@@ -1068,8 +1088,16 @@ export function definePwshTool(pi: ExtensionAPI) {
       // process instead of scanning process tables.
       if (params.action === "list") {
         const jobs = jm.listJobs();
-        const text = jobsReport(jobs, Date.now(), (job) => jm.pidsFor(job));
-        return toolText(text, emptyDetails(params, cwd, ""));
+        const pwshIds = new Set(jobs.map((job) => job.id));
+        const sections = [
+          jobsReport(jobs, Date.now(), (job) => jm.pidsFor(job)),
+        ];
+        // The host's own roster (bash/task/eval) is a read-only extra: it makes
+        // this listing the session's job view without pretending pwsh can
+        // control those jobs — reading one is `read proc://<id>`.
+        const hostRows = hostJobsReport(ctx, pwshIds);
+        if (hostRows) sections.push(hostRows);
+        return toolText(sections.join("\n\n"), emptyDetails(params, cwd, ""));
       }
 
       if (params.action && !params.jobId) {
@@ -1147,6 +1175,15 @@ export function definePwshTool(pi: ExtensionAPI) {
 
         // Default, action: "status", or a wait that already settled
         if (!job) {
+          // A host job id (bash/task/eval) is not a failure: point at the
+          // surface that owns it instead of claiming it does not exist.
+          const hostJob = findHostJob(ctx, params.jobId);
+          if (hostJob) {
+            return toolText(
+              hostJobHint(hostJob, params.action),
+              emptyDetails(params, cwd, ""),
+            );
+          }
           const err = `Job '${params.jobId}' not found.`;
           return toolText(err, emptyDetails(params, cwd, err), true);
         }
@@ -1181,11 +1218,10 @@ export function definePwshTool(pi: ExtensionAPI) {
         });
 
         const pids = jm.pidsFor(job);
-        const pidText = pids.length > 0 ? ` (pid ${pids.join(", ")})` : "";
         const text = [
-          `Background job '${job.id}' started${pidText}.`,
-          `Command: ${job.command}`,
-          `The result will be delivered automatically upon completion. Wait with { jobId: "${job.id}", action: "wait" }, inspect with { jobId: "${job.id}" }, stop with { jobId: "${job.id}", action: "kill" }, or list every job with { action: "list" }.`,
+          // Same result shape bash returns for `async: true`.
+          backgroundNoticeText(job, pids),
+          jobControlHint(job.id),
         ].join("\n");
 
         return toolText(text, {

@@ -168,8 +168,10 @@ test("threshold elapse backgrounds the command and folds its result later", asyn
   );
 
   expect(result.text).toContain("Backgrounded as job");
-  // The bash-aligned mode: the command owns its process, so nothing is held.
-  expect(result.text).toContain("its own PowerShell process");
+  // Same delivery promise as bash's background notice: a follow-up, not a poll.
+  expect(result.text).toContain(
+    "its output is injected into the conversation as a follow-up",
+  );
   expect(keys[0]?.startsWith("auto:")).toBe(true);
   expect(result.details.async).toBe(true);
   expect(result.details.status).toBe("running");

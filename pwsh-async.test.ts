@@ -7,6 +7,7 @@ import {
   runPwsh,
 } from "./pwsh-tool";
 import {
+  MAX_RUNNING_JOBS,
   MAX_RETAINED_SETTLED_JOBS,
   PwshJobManager,
   appendPwshJobOutput,
@@ -198,7 +199,7 @@ test("starts an async job immediately without blocking and delivers result via s
   });
 
   // Tool execution returns immediately with running state
-  expect(res.content[0]?.text).toContain("Background job");
+  expect(res.content[0]?.text).toContain("Backgrounded as job");
   const details = res.details;
   expect(details.async).toBe(true);
   expect(details.status).toBe("running");
@@ -235,7 +236,7 @@ test("starts an async job immediately without blocking and delivers result via s
     expect(msg.details.label).toBe("Testing async execution");
   }
   expect(job?.intent).toBe("Testing async execution");
-  expect(job?.timeoutSec).toBe(120);
+  expect(job?.timeoutSec).toBe(300);
   expect(delivery.options).toEqual({ deliverAs: "aside", triggerTurn: true });
 });
 
@@ -657,16 +658,16 @@ test("returns immediately when signal is already aborted without executing comma
   expect(res.content[0]?.text).toContain("Command cancelled");
 });
 
-test("normalizes default timeout to 120s and allows 0 to disable timeout", async () => {
+test("normalizes default timeout to bash's 300s and allows 0 to disable it", async () => {
   const { startJob } = makeTool();
 
   // Start with default timeout (omitted)
   const defaultStart = await startJob("call_default_timeout", {
     command: "Write-Output 'default timeout'",
   });
-  expect(defaultStart.res.details?.timeoutSec).toBe(120);
+  expect(defaultStart.res.details?.timeoutSec).toBe(300);
   const defaultJob = getJobManager().getJob(defaultStart.jobId);
-  expect(defaultJob?.timeoutSec).toBe(120);
+  expect(defaultJob?.timeoutSec).toBe(300);
   await defaultJob?.settled;
 
   // Start with 0 timeout (disabled)
@@ -1152,6 +1153,48 @@ test("streamed output tracks total characters and the last output time", () => {
   expect(job.lastOutputAt).toBeGreaterThanOrEqual(before);
 });
 
+test("the private manager enforces the host's running-job cap", () => {
+  // A session whose run never settles keeps each job "running" without
+  // spawning a process, so the cap is observable without real workers.
+  const pool = {
+    getOrCreate: () => ({
+      pid: 1,
+      dead: false,
+      run: () => new Promise(() => {}),
+    }),
+    dispose: () => {},
+    pidFor: () => [1],
+  } as unknown as PwshSessionPool;
+  const manager = new PwshJobManager(pool);
+
+  for (let i = 0; i < MAX_RUNNING_JOBS; i += 1) {
+    manager.startJob({ command: `job ${i}`, cwd: process.cwd() });
+  }
+
+  expect(() =>
+    manager.startJob({ command: "one too many", cwd: process.cwd() }),
+  ).toThrow(`Background job limit reached (${MAX_RUNNING_JOBS})`);
+
+  // At the cap an auto-backgrounding call is refused too, so the foreground
+  // call keeps waiting instead of backgrounding without a record.
+  expect(
+    manager.adoptJob({
+      command: "adopt",
+      cwd: process.cwd(),
+      sessionKey: "foreground",
+      startTime: Date.now(),
+      output: "",
+      timeoutSec: 0,
+      abortController: new AbortController(),
+      settled: new Promise<PwshJob>(() => {}),
+      onProgress: () => () => {},
+    }),
+  ).toBeUndefined();
+
+  manager.disposeAll();
+  expect(manager.listJobs()).toHaveLength(0);
+});
+
 test("action 'list' enumerates jobs without a jobId", async () => {
   const { tool, startJob } = makeTool();
   getJobManager().disposeAll();
@@ -1198,4 +1241,102 @@ test("action 'list' enumerates jobs without a jobId", async () => {
     undefined,
     undefined,
   );
+});
+
+test("an async start reads like bash's background notice", async () => {
+  const { startJob } = makeTool();
+
+  const { jobId, res } = await startJob("call_bash_notice", {
+    command: "Write-Output 'notice'",
+  });
+  const text = res.content[0]?.text ?? "";
+
+  // Same sentences bash's formatBackgroundNotice produces, so the two shells
+  // teach the model one background contract.
+  expect(text).toContain(`Backgrounded as job ${jobId}`);
+  expect(text).toContain(
+    "its output is injected into the conversation as a follow-up the moment it finishes",
+  );
+  expect(text).toContain(
+    "Do NOT poll for it (no `sleep`, `ps`, `pgrep`, `top`, `pidwait`, log tailing)",
+  );
+  expect(text).toContain("killed once it has run 300s in total");
+
+  await getJobManager().getJob(jobId)?.settled;
+});
+
+/** A tool context exposing only the published host's read surface. */
+function hostSnapshotContext() {
+  const now = Date.now();
+  return {
+    getAsyncJobSnapshot: () => ({
+      running: [
+        {
+          id: "bg_7",
+          type: "bash",
+          status: "running",
+          label: "npm test",
+          startTime: now - 12_000,
+          ownerId: "main",
+        },
+      ],
+      recent: [
+        {
+          id: "bg_6",
+          type: "task",
+          status: "completed",
+          label: "scan",
+          startTime: now - 90_000,
+          endTime: now - 80_000,
+          ownerId: "main",
+        },
+      ],
+      delivery: {},
+    }),
+  };
+}
+
+test("a host job id reports its owner and the proc:// path instead of not-found", async () => {
+  const { tool } = makeTool();
+  const ctx = hostSnapshotContext() as never;
+
+  const status = await tool.execute(
+    "call_host_status",
+    { jobId: "bg_7" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  expect(status.content[0]?.text).toContain("host background job (bash, running)");
+  expect(status.content[0]?.text).toContain("read proc://bg_7");
+  expect(status.isError).toBeFalsy();
+
+  const kill = await tool.execute(
+    "call_host_kill",
+    { jobId: "bg_7", action: "kill" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  expect(kill.content[0]?.text).toContain(
+    'write { path: "proc://bg_7/kill" }',
+  );
+});
+
+test("action 'list' appends the host's own jobs from the snapshot API", async () => {
+  const { tool } = makeTool();
+  getJobManager().disposeAll();
+
+  const res = await tool.execute(
+    "call_list_host_jobs",
+    { action: "list" },
+    undefined,
+    undefined,
+    hostSnapshotContext() as never,
+  );
+  const text = res.content[0]?.text ?? "";
+  expect(text).toContain("No PowerShell background jobs");
+  expect(text).toContain("Host jobs (read proc://<id>)");
+  expect(text).toContain("bg_7 running");
+  expect(text).toContain("bg_6 completed");
 });

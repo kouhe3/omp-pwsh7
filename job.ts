@@ -23,7 +23,19 @@ const MAX_DELIVERY_OUTPUT_CHARS = 16 * 1024;
  */
 export const MAX_RETAINED_SETTLED_JOBS = 32;
 
-export const DEFAULT_TIMEOUT_SEC = 120;
+/**
+ * Running-job cap for the private manager, mirroring the host manager's
+ * `async.maxJobs` ceiling that bash jobs also obey. Without it this registry —
+ * process-global and shared by every session in the process — could start
+ * unbounded PowerShell workers.
+ */
+export const MAX_RUNNING_JOBS = 100;
+
+/**
+ * Default command deadline, matching omp bash's `TOOL_TIMEOUTS.bash.default`
+ * (300s) so the two shells behave the same when `timeout` is omitted.
+ */
+export const DEFAULT_TIMEOUT_SEC = 300;
 
 export type PwshJobStatus = "running" | "completed" | "failed" | "killed";
 
@@ -446,6 +458,11 @@ export class PwshJobManager implements PwshJobsRuntime {
   }
 
   startJob(options: StartJobOptions): PwshJob {
+    if (this.#runningCount() >= MAX_RUNNING_JOBS) {
+      throw new Error(
+        `Background job limit reached (${MAX_RUNNING_JOBS}). Wait for running jobs to finish or kill one.`,
+      );
+    }
     const id = this.generateJobId();
     const sessionKey = `async:${id}`;
     const abortController = new AbortController();
@@ -507,6 +524,8 @@ export class PwshJobManager implements PwshJobsRuntime {
    * retention behave exactly as for a started job.
    */
   adoptJob(options: AdoptJobOptions): PwshJob | undefined {
+    // Same cap as a started job: the caller keeps its foreground wait instead.
+    if (this.#runningCount() >= MAX_RUNNING_JOBS) return undefined;
     const id = this.generateJobId();
     const job: PwshJob = {
       id,
@@ -540,6 +559,14 @@ export class PwshJobManager implements PwshJobsRuntime {
       this.#jobsChanged?.();
     });
     return job;
+  }
+
+  #runningCount(): number {
+    let running = 0;
+    for (const job of this.#jobs.values()) {
+      if (job.status === "running") running += 1;
+    }
+    return running;
   }
 
   killJob(id: string): PwshJob | undefined {

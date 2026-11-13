@@ -1,24 +1,32 @@
 /**
  * Host-backed pwsh background jobs.
  *
- * omp's session exposes a scoped async-job surface (`ctx.asyncJobs`) that lets an
- * extension register jobs which ride the same lifecycle as the built-in
+ * omp's session can expose a scoped async-job surface (`ctx.asyncJobs`) that
+ * lets an extension register jobs which ride the same lifecycle as the built-in
  * `bash`/`task`/`eval` jobs: a row in the jobs sheet with progress and the live
  * pid, the session's running-job cap, cancellation from either side, and
- * completion delivery that wakes the model. Stock omp (18.4/18.6) has no such
- * surface, so the tool falls back to its own {@link PwshJobManager}; this runtime
- * is only selected when the surface is present and complete.
+ * completion delivery that wakes the model. The published omp 18.20 host does
+ * not expose it (18.10 did), so the tool falls back to its own
+ * {@link PwshJobManager}; this runtime is only selected when the surface is
+ * present and complete.
  *
  * Delivery ownership moves to the host: the job body returns the result text and
  * the manager posts the `async-result` aside. A `wait` therefore reports the
  * settled state and leaves the payload to that delivery instead of inlining an
  * output the model is about to receive anyway (`resultDelivery: "host"`).
  *
- * The surface is typed structurally, not imported from the SDK: the extension
- * compiles against a published omp whose `ExtensionContext` has no `asyncJobs`
- * field, and must keep compiling — and runtime-degrading — when it is loaded
- * into that host.
+ * The registration shape is kept locally as a reserved interface: omp 18.10
+ * exposed it, the published 18.20 host does not, and the structural copy keeps
+ * the extension compiling — and runtime-degrading — without pinning a fork's
+ * types. The current host still has the *read* half —
+ * `ctx.getAsyncJobSnapshot()` — which this module also wraps: host-owned jobs
+ * (bash/task/eval) stay addressable by id and are rendered as
+ * `read proc://<id>` rows instead of pretending this tool can control them.
  */
+import type {
+  AsyncJobSnapshot,
+  AsyncJobSnapshotItem,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import {
   type AdoptJobOptions,
   DEFAULT_TIMEOUT_SEC,
@@ -31,6 +39,7 @@ import {
   type PwshWaitOutcome,
   type StartJobOptions,
 } from "./job";
+import { sanitizeTerminalText } from "./sanitize";
 import type { PwshSessionPool } from "./session";
 
 /** Running-progress text cap, matching bash's 50 KiB streaming preview. */
@@ -62,10 +71,11 @@ export interface HostAsyncJobOptions {
 }
 
 /**
- * Structural view of omp's scoped async-job surface. `cancel` is required: a
- * job whose only kill path were the extension's own abort would surface as a
- * *failed* job and would have its error delivered, so a host without it gets the
- * private manager instead of a half-working mode.
+ * Reserved registration surface: the scoped async-job API omp 18.10 exposed on
+ * `ExtensionContext`. `cancel` is required by the feature test — a job whose
+ * only kill path were the extension's own abort would surface as a *failed* job
+ * and would have its error delivered, so a host without it gets the private
+ * manager instead of a half-working mode.
  */
 export interface HostAsyncJobs {
   register(
@@ -90,6 +100,97 @@ export function hostAsyncJobs(ctx: unknown): HostAsyncJobs | undefined {
     return undefined;
   }
   return candidate as HostAsyncJobs;
+}
+
+/**
+ * Latest-omp read surface: the session's own jobs exactly as the jobs sheet and
+ * `proc://` see them. Unlike the registration half this exists in the published
+ * host, so it is the live fallback whenever a job id the extension does not own
+ * is looked up.
+ */
+export interface HostJobsReader {
+  getAsyncJobSnapshot(options?: {
+    recentLimit?: number;
+  }): AsyncJobSnapshot | null;
+}
+
+/** Feature-detect the read surface on a tool/command context. */
+export function hostJobsReader(ctx: unknown): HostJobsReader | undefined {
+  const candidate = ctx as Partial<HostJobsReader> | null | undefined;
+  return typeof candidate?.getAsyncJobSnapshot === "function"
+    ? (candidate as HostJobsReader)
+    : undefined;
+}
+
+/**
+ * The session's host jobs (bash/task/eval), running first, then recent. Empty
+ * when the host has no read surface or the snapshot call fails — callers treat
+ * this as "no extra jobs", never as an error.
+ */
+export function hostJobEntries(
+  ctx: unknown,
+  recentLimit = 20,
+): AsyncJobSnapshotItem[] {
+  const reader = hostJobsReader(ctx);
+  if (!reader) return [];
+  try {
+    const snapshot = reader.getAsyncJobSnapshot({ recentLimit });
+    return snapshot ? [...snapshot.running, ...snapshot.recent] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Look up one host job by id, for ids this extension does not own. */
+export function findHostJob(
+  ctx: unknown,
+  id: string,
+): AsyncJobSnapshotItem | undefined {
+  return hostJobEntries(ctx, 50).find((job) => job.id === id);
+}
+
+/** One-line pointer to the host's own view of a job it owns. */
+export function hostJobHint(
+  job: AsyncJobSnapshotItem,
+  action?: string,
+): string {
+  const control =
+    action === "kill"
+      ? `write { path: "proc://${job.id}/kill" } to stop it`
+      : action === "wait"
+        ? "wait for it with the generic wait tool"
+        : `read proc://${job.id} for its status, output, and streams`;
+  return `Job '${job.id}' is a host background job (${job.type}, ${job.status}); ${control}.`;
+}
+
+/**
+ * `proc://` roster rows for host jobs this tool does not own. Host-backed pwsh
+ * jobs are excluded: their ids are already in the pwsh listing, and listing
+ * them twice would suggest two different control paths.
+ */
+export function hostJobsReport(
+  ctx: unknown,
+  exclude: ReadonlySet<string> = new Set(),
+  now = Date.now(),
+): string {
+  const jobs = hostJobEntries(ctx).filter((job) => !exclude.has(job.id));
+  if (jobs.length === 0) return "";
+  const lines = ["Host jobs (read proc://<id>):"];
+  for (const job of jobs) {
+    const elapsed = ((job.endTime ?? now) - job.startTime) / 1000;
+    const marker =
+      job.status === "running"
+        ? "●"
+        : job.status === "cancelled"
+          ? "◼"
+          : job.status === "completed"
+            ? "✓"
+            : "✗";
+    lines.push(
+      `  ${marker} ${job.id} ${job.status} ${elapsed.toFixed(1)}s — ${sanitizeTerminalText(job.label)}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 export class HostPwshJobs implements PwshJobsRuntime {
