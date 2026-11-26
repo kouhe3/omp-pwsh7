@@ -43,17 +43,25 @@ const zStub = {
   boolean: schema,
 };
 
+/** The unicode symbol preset's keys the card reads (`theme/symbols.ts`). */
+const SYMBOLS: Record<string, string> = {
+  "status.success": "✔",
+  "status.error": "✘",
+  "status.warning": "⚠",
+  "status.running": "⟳",
+  "status.aborted": "⏹",
+  "status.pending": "⏳",
+  "sep.dot": " · ",
+  "tool.bash": "❯",
+  "lang.shell": "💻",
+};
+
 const theme = {
   fg: (_color: string, text: string) => `\x1b[38;5;244m${text}\x1b[0m`,
-  boxRound: {
-    topLeft: "╭",
-    topRight: "╮",
-    bottomLeft: "╰",
-    bottomRight: "╯",
-    horizontal: "─",
-    vertical: "│",
+  symbols: {
+    symbol: (key: string) => SYMBOLS[key] ?? "",
+    langIcon: (lang: string | undefined) => (lang === "powershell" ? "💻" : ""),
   },
-  boxSharp: { teeLeft: "┤", teeRight: "├", horizontal: "─" },
 };
 
 type SentMessage = { message: unknown; options: unknown };
@@ -288,12 +296,10 @@ test("can inspect status and kill a running async job", async () => {
 
   expect(runningCard).toContain("running");
   expect(runningCard).toContain(jobId);
-  // Ergonomic check: No divider followed by bottom border (no double bottom lines)
-  expect(runningCard).not.toContain("├───");
+  // Body rows only: the host draws the call's box around them.
+  expect(runningCard).not.toMatch(/[╭╮╰╯│├┤]/);
+  // The status row closes the card.
   expect(runningRows[runningRows.length - 1]).toContain("running");
-  expect(
-    Bun.stripANSI(runningRows[runningRows.length - 1]!).startsWith("╰"),
-  ).toBe(true);
 
   // Verify ergonomic card rendering for killed job (Case 1 with fallback title and command context)
   const killedRows = tool
@@ -310,17 +316,14 @@ test("can inspect status and kill a running async job", async () => {
   expect(killedCard).toContain(`Kill job ${jobId}`);
   // Ergonomic check: Displays the cancelled command from details even though args.command was empty
   expect(killedCard).toContain("Start-Sleep");
-  // Ergonomic check: Closing line has the status directly
+  // Ergonomic check: the status row closes the card
   expect(killedRows[killedRows.length - 1]).toContain("killed");
-  expect(
-    Bun.stripANSI(killedRows[killedRows.length - 1]!).startsWith("╰"),
-  ).toBe(true);
 
-  // Ensure all rows have exact same visual column width
+  // No row may be wider than the width the host handed the renderer.
   const widths = killedRows.map((r) =>
     Bun.stringWidth(r, { countAnsiEscapeCodes: false }),
   );
-  expect(new Set(widths).size).toBe(1);
+  expect(Math.max(...widths)).toBeLessThanOrEqual(80);
 });
 
 test("handles command interruption by message gracefully", async () => {

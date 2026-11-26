@@ -1,0 +1,4 @@
+# npmmirror lags on @oh-my-pi native leaves (pi-natives-win32-x64@19.2.1 missing),
+# which breaks `bun test` for anything importing @oh-my-pi/pi-tui/text/width.
+[install.scopes]
+"@oh-my-pi" = "https://registry.npmjs.org"

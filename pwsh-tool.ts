@@ -9,14 +9,11 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ExtensionRows,
   ToolExecutionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
-// Host-owned pi-tui instance (OMP rewrites every `@oh-my-pi/pi-*` specifier in
-// extension sources to the module it already has loaded). Required because the
-// framed-block mark is a module-private Symbol: a copy from our own
-// node_modules would mark the component with a symbol the host never checks.
-import { markFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import {
+  STEERED_NOTICE,
   TOOL_LABEL,
   callTitle,
   commandBlock,
@@ -124,6 +121,10 @@ export interface PwshDetails {
   output?: string | null;
   wallTimeMs: number;
   async?: boolean;
+  /** A steering interrupt detached this call into a background job. */
+  steered?: boolean;
+  /** The caller's abort stopped the command (Esc / cancel); `isError` is set. */
+  cancelled?: boolean;
   jobId?: string;
   status?: PwshJobStatus;
   command?: string;
@@ -527,9 +528,11 @@ export async function runPwsh(
         unbridgeAbort();
         details.wallTimeMs = Date.now() - started;
         const pids = api.pidFor(job.sessionKey);
+        const jobState = jobDetails(job, params, cwd, "", pids);
+        jobState.steered = waited.outcome === "steer";
         return {
           text: autoBackgroundedText(job, waited.outcome === "steer", pids),
-          details: jobDetails(job, params, cwd, "", pids),
+          details: jobState,
         };
       }
     }
@@ -579,12 +582,16 @@ export async function runPwsh(
     // The loop's own steering/IRC reason, from the global symbol registry.
     const isMessageInterruption =
       signal?.reason === TOOL_INTERRUPT_ABORT_REASON;
+    details.cancelled = !isMessageInterruption;
     const msg = isMessageInterruption
       ? "Command interrupted by message."
       : "Command cancelled.";
     return {
       text: `${msg}${runResult.partialOutput ? `\nPartial output:\n${runResult.partialOutput}` : ""}`,
       details,
+      // A steer only ends the wait (auto-backgrounding detaches it); a real
+      // cancellation is an error, as bash's ToolAbortError is.
+      isError: !isMessageInterruption,
     };
   }
 
@@ -746,9 +753,7 @@ function autoBackgroundedText(
   pids: readonly number[],
 ): string {
   return [
-    steered
-      ? "Backgrounded early to handle an incoming message; the command keeps running."
-      : undefined,
+    steered ? STEERED_NOTICE : undefined,
     backgroundNoticeText(job, pids),
     jobControlHint(job.id),
   ]
@@ -984,10 +989,10 @@ export function definePwshTool(pi: ExtensionAPI) {
       ` ${JOB_SURFACE_DESCRIPTION} Supports text (Out-String) and JSON (ConvertTo-Json) output formats.`,
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
     loadMode: "essential" as const,
-    // Merge call+result into one frame like built-in tools: the pending call
-    // renders the command block; once the result lands the same slot redraws
-    // as the full frame (status title + command + output). Read by
-    // ToolExecutionComponent via the wrapper proxy (tool-execution.ts:1012).
+    // Merge call+result into one card like built-in tools: the pending call
+    // renders the command rows; once the result lands the same slot redraws
+    // with status and output. Read by the host's `legacyPresenter`
+    // (`ui/tools/legacy.ts`) through the wrapper proxy.
     mergeCallAndResult: true as boolean,
     // Auto-backgrounding also makes the call steerable: an incoming message must
     // be able to detach a running command instead of waiting it out (bash does
@@ -1259,30 +1264,29 @@ export function definePwshTool(pi: ExtensionAPI) {
     },
     renderCall(args: PwshParams, options: PwshRenderOptions, theme: Theme) {
       // While the model is still emitting the arguments, show the inline pending
-      // row (grep/glob style: one line, no card) instead of a frame — a
-      // half-streamed command must not draw a card, and neither the intent nor the
-      // cwd have finished arriving. Marked as framed so the host adds neither
-      // padding nor its state tint; the leading column is ours, like the
-      // `Text(text, 1, 0)` those built-ins return.
+      // row (grep/glob style: one line, no card body) instead of a card — a
+      // half-streamed command must not draw one, and neither the intent nor the
+      // cwd have finished arriving.
       // Resolved here, not inside `render`: the host calls this hook while the
-      // streamed args still carry `i`, and only paints the returned component
-      // later (often never, once a fast result replaces it) — a title computed
-      // lazily would miss its only chance to be remembered.
+      // streamed args still carry `i`, and only paints the returned rows later
+      // (often never, once a fast result replaces it) — a title computed lazily
+      // would miss its only chance to be remembered.
       const label = callTitle(args);
       if (options.argsComplete !== true) {
-        return markFramedBlockComponent({
+        return {
           render: () => [renderPendingRow(theme, label)],
-        });
+        } satisfies ExtensionRows;
       }
-      return markFramedBlockComponent({
+      // A rows object is drawn inside the host's custom-tool box: the title row
+      // and the command rows only, no frame of our own.
+      return {
         render: (width: number) =>
           commandBlock(theme, width, args.command ?? "", {
             label,
             cwd: args.cwd,
-            closed: true,
             expanded: options.expanded === true,
           }),
-      });
+      } satisfies ExtensionRows;
     },
     renderResult(
       result: PwshRenderResult,
@@ -1293,24 +1297,23 @@ export function definePwshTool(pi: ExtensionAPI) {
       const d = result.details;
       if (!d) {
         // Partial/pending result (onUpdate fired, no details yet): args are
-        // complete by now, so keep the command block visible.
+        // complete by now, so keep the command visible.
         const label = callTitle(args);
-        return markFramedBlockComponent({
+        return {
           render: (width: number) =>
             commandBlock(theme, width, args?.command ?? "", {
               label,
               cwd: args?.cwd,
-              closed: true,
               expanded: options.expanded === true,
             }),
-        });
+        } satisfies ExtensionRows;
       }
       const displayDetails = {
         ...d,
         timeoutSec: d.timeoutSec ?? normalizeTimeout(args?.timeout),
       };
       const label = callTitle(args);
-      return markFramedBlockComponent({
+      return {
         render: (width: number) => {
           const effectiveCommand = args?.command || d.command || "";
           return renderCard(theme, width, effectiveCommand, displayDetails, {
@@ -1322,7 +1325,7 @@ export function definePwshTool(pi: ExtensionAPI) {
             isError: result.isError === true,
           });
         },
-      });
+      } satisfies ExtensionRows;
     },
   };
 }

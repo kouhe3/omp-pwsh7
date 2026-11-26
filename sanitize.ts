@@ -20,10 +20,9 @@ const TERMINAL_CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
 /**
  * Strip terminal control sequences from untrusted text.
  *
- * The host renders custom renderer rows verbatim (`SafeToolRendererComponent.render`
- * returns them unchanged, `chat/tool-execution.ts`), so an OSC 52 clipboard
- * sequence in a job's output would otherwise be written straight to the user's
- * terminal.
+ * The host paints a rows renderer's output verbatim (`paintRows` in its own
+ * tool look, `ui/styles/tools/legacy.ts`), so an OSC 52 clipboard sequence in a
+ * job's output would otherwise be written straight to the user's terminal.
  *
  * Call it on *raw* text only: the theme colors and Shiki highlights composed
  * afterwards are ours and must survive (sanitizing a composed row would strip

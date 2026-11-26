@@ -1,264 +1,158 @@
 /**
- * Card rendering for the `pwsh` tool: the framed block, the one-row pending
- * line, and the title/status text they share.
+ * Card rendering for the `pwsh` tool: the rows drawn inside the host's
+ * custom-tool box, the one-row pending line, and the title/status text they
+ * share.
  *
  * Split out of `pwsh-tool.ts` so the tool definition stays about execution.
- * Host-owned pi-tui instance (see `pwsh-tool.ts`): the workdir formatter has to
- * come from the module the host itself loaded, so both sides agree on the path.
+ *
+ * The render hooks return a rows object, not a component: omp boxes those rows
+ * itself (one blank row above and below, one cell of padding, the call's state
+ * tint) and draws no head for one, so a card here draws its own title and body
+ * rows — and no frame, which would nest one box inside another. Widths and ANSI
+ * handling come from the host's own text engine
+ * (`@oh-my-pi/pi-tui/text/width`), the same one that measures the box the rows
+ * land in.
  */
-import { formatToolWorkingDirectory } from "@oh-my-pi/pi-tui/render";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+  replaceTabs,
+  truncate,
+  visibleWidth,
+  wrap,
+} from "@oh-my-pi/pi-tui/text/width";
 import type { PwshDetails } from "./pwsh-tool";
 import { sanitizeTerminalText } from "./sanitize";
 import { highlightPowerShell } from "./syntax";
 
+/**
+ * The visible counterpart of bash's steer notice: a steering message detached
+ * this call into a background job while the command keeps running.
+ */
+export const STEERED_NOTICE =
+  "Backgrounded early to handle an incoming message; the command keeps running.";
+
+/**
+ * What the card needs from the extension theme: the pi-tui `Theme` (`fg`,
+ * `symbols`) is structurally assignable, and a test double only has to carry
+ * `fg`.
+ */
 export interface Theme {
   fg(color: string, text: string): string;
-  bg?(color: string, text: string): string;
-  bold?(text: string): string;
-  styledSymbol?(key: string, color: string): string;
-  boxRound?: {
-    topLeft: string;
-    topRight: string;
-    bottomLeft: string;
-    bottomRight: string;
-    horizontal: string;
-    vertical: string;
-  };
-  boxSharp?: {
-    teeLeft: string;
-    teeRight: string;
-    horizontal: string;
+  symbols?: {
+    symbol(key: string): string;
+    langIcon?(lang: string | undefined): string;
   };
 }
 
-/** Column width of one code point. */
-function codePointWidth(char: string): number {
-  return Bun.stringWidth(char);
-}
-
 /**
- * Visible width of a possibly-ANSI-colored string, from `Bun.stringWidth` — the
- * same metric the host's TUI uses (`AGENTS.md`: "String width:
- * `Bun.stringWidth()`"). The previous hand-rolled table only covered the BMP: an
- * astral emoji measured 1 column when wrapping (code-point loop) but 2 when
- * padding (UTF-16 loop), so any row containing one came out a column wider than
- * its siblings and pushed the right border out.
+ * Glyph of a theme symbol key, else `fallback`: `symbol` answers `""` for a key
+ * a theme leaves out, and an ascii symbol preset has no icons at all.
  */
-function visibleLength(text: string): number {
-  return Bun.stringWidth(text, { countAnsiEscapeCodes: false });
+function glyph(theme: Theme, key: string, fallback: string): string {
+  return theme.symbols?.symbol(key) || fallback;
 }
 
-/**
- * Slice a possibly-ANSI-colored string to `max` visible columns, preserving
- * escapes. A truncation spends one of those columns on `…`, so the result never
- * exceeds `max` — appending the ellipsis on top of a full-budget slice pushed
- * rows one column past the frame border.
- */
-function ansiSafeSlice(text: string, max: number): string {
-  if (max <= 0) return "";
-  const budget = visibleLength(text) <= max ? max : max - 1;
-  let visible = 0;
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "\x1b") {
-      const end = text.indexOf("m", i);
-      if (end === -1) {
-        out += text.slice(i);
-        break;
-      }
-      out += text.slice(i, end + 1);
-      i = end + 1;
-      continue;
-    }
-    // Step by code point: a surrogate pair is one glyph, not two columns.
-    const char = String.fromCodePoint(text.codePointAt(i) ?? 0);
-    const w = codePointWidth(char);
-    if (visible + w > budget) break;
-    out += char;
-    visible += w;
-    i += char.length;
-  }
-  if (i < text.length) out += "…";
-  return out;
+/** The `·` that separates a row's parts (`sep.dot` carries its own spaces). */
+function dot(theme: Theme): string {
+  return theme.symbols?.symbol("sep.dot") || " · ";
 }
 
-/** Wrap ANSI-colored text into terminal-width rows without dropping characters. */
-function wrapAnsiLine(text: string, max: number): string[] {
-  if (max <= 0) return [text];
-  const rows: string[] = [];
-  let row = "";
-  let visible = 0;
-  let activeSgr = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "\x1b") {
-      const end = text.indexOf("m", i);
-      if (end === -1) {
-        row += text.slice(i);
-        break;
-      }
-      const sequence = text.slice(i, end + 1);
-      row += sequence;
-      if (sequence.startsWith("\x1b[")) {
-        const params = sequence.slice(2, -1).split(";").filter(Boolean);
-        if (
-          params.length === 0 ||
-          params.some(
-            (param) => param === "0" || param === "39" || param === "49",
-          )
-        ) {
-          activeSgr = "";
-        } else {
-          activeSgr += sequence;
-        }
-      }
-      i = end + 1;
-      continue;
-    }
+/** Fallback glyphs of the status keys, matching the unicode symbol preset. */
+const STATUS_FALLBACKS = {
+  success: "✔",
+  error: "✘",
+  warning: "⚠",
+  running: "⟳",
+  aborted: "⏹",
+  pending: "⏳",
+} as const;
 
-    const codePoint = text.codePointAt(i) ?? 0;
-    const char = String.fromCodePoint(codePoint);
-    const width = codePointWidth(char);
-    if (visible > 0 && visible + width > max) {
-      if (activeSgr) row += "\x1b[0m";
-      rows.push(row);
-      row = activeSgr;
-      visible = 0;
-    }
-    row += char;
-    visible += width;
-    i += char.length;
-  }
-  if (activeSgr) row += "\x1b[0m";
-  if (row || rows.length === 0) rows.push(row);
-  return rows;
+type StatusName = keyof typeof STATUS_FALLBACKS;
+
+/** Status glyph by name (`status.<name>`), themed like the host's own cards. */
+function statusGlyph(theme: Theme, name: StatusName): string {
+  return glyph(theme, `status.${name}`, STATUS_FALLBACKS[name]);
 }
-
-// ---------------------------------------------------------------------------
-// Eval-style frame builders: titled top bar, tee divider with label, rows,
-// bottom bar. Mirrors the built-in eval/bash rendering (`╭─── Title ───╮`,
-// `├─── Output ───┤`) within the extension's duck-typed component limits.
-// ---------------------------------------------------------------------------
-
-/**
- * Inner frame width. One column shorter than the maximum so the closing tee /
- * corner survives width math: box-drawing glyphs (U+2500-U+257F) are
- * Ambiguous-width, and some width engines count them as 2 columns.
- */
-function frameInnerWidth(width: number): number {
-  return Math.max(10, width - 3);
-}
-
-/**
- * `╭─── {title} ────────────────────╮`
- * Border glyphs are colored independently so ANSI inside `title` (icon/status
- * colors) cannot reset the frame color mid-line.
- */
-function frameTop(width: number, theme: Theme, title: string): string {
-  const br = theme.boxRound;
-  const h = br?.horizontal ?? "-";
-  const inner = frameInnerWidth(width);
-  // `╭─── {title} {fill}╮`: three leader dashes, their trailing space, the space
-  // after the title and the two corners consume five columns, so this is the
-  // title's budget. Clamping the title (rather than letting `fill` floor at 0)
-  // is what keeps a long, model-authored intent inside the frame it drew.
-  const shown = ansiSafeSlice(title, Math.max(1, inner - 5));
-  const fill = Math.max(0, inner - 5 - visibleLength(shown));
-  const cornerL = theme.fg("border", br?.topLeft ?? "+");
-  const cornerR = theme.fg("border", br?.topRight ?? "+");
-  const prefix = theme.fg("border", `${h}${h}${h} `);
-  const hline = theme.fg("border", h.repeat(fill));
-  return `${cornerL}${prefix}${shown} ${hline}${cornerR}`;
-}
-
-/**
- * `├─── {label} ────────────────────┤`
- * NOTE: omp's symbol table names tees from the glyph's own direction
- * (teeLeft = `┤`, teeRight = `├`), so left border uses `teeRight` and vice
- * versa. Tees and filler share one ANSI segment per side so terminal width
- * handling can never drop the closing tee.
- */
-function frameDivider(width: number, theme: Theme, label: string): string {
-  const bs = theme.boxSharp;
-  const h = theme.boxRound?.horizontal ?? bs?.horizontal ?? "-";
-  const teeL = bs?.teeRight ?? "├";
-  const teeR = bs?.teeLeft ?? "┤";
-  const inner = frameInnerWidth(width);
-  // Same budget as the top bar (three dashes, their space, the space after the
-  // label, two tees): a status label such as `✓ completed · Wall: … | Timeout:
-  // 120s` is longer than a narrow frame and used to be drawn at full length.
-  const shown = ansiSafeSlice(label, Math.max(1, inner - 5));
-  const fill = Math.max(0, inner - 5 - visibleLength(shown));
-  const left = theme.fg("border", `${teeL}${h}${h}${h} `);
-  const right = theme.fg("border", `${h.repeat(fill)}${teeR}`);
-  return `${left}${shown} ${right}`;
-}
-
-/** `│ content (padded) │` - one content row inside the frame. */
-function frameRow(content: string, width: number, theme: Theme): string {
-  const br = theme.boxRound;
-  const v = theme.fg("border", br?.vertical ?? "|");
-  const inner = frameInnerWidth(width);
-  const sliced = ansiSafeSlice(content, inner - 2);
-  const pad = Math.max(0, inner - 2 - visibleLength(sliced));
-  return `${v} ${sliced}${" ".repeat(pad)} ${v}`;
-}
-
-/** `╰────────────────────────╯` */
-function frameBottom(width: number, theme: Theme): string {
-  const br = theme.boxRound;
-  const h = br?.horizontal ?? "-";
-  const inner = frameInnerWidth(width);
-  return theme.fg(
-    "border",
-    `${br?.bottomLeft ?? "+"}${h.repeat(inner)}${br?.bottomRight ?? "+"}`,
-  );
-}
-
-/** `╰─── status ────────────────────────╯` */
-function frameBottomWithStatus(
-  width: number,
-  theme: Theme,
-  label: string,
-): string {
-  const br = theme.boxRound;
-  const bs = theme.boxSharp;
-  const h = br?.horizontal ?? bs?.horizontal ?? "-";
-  const cornerL = br?.bottomLeft ?? "+";
-  const cornerR = br?.bottomRight ?? "+";
-  const inner = frameInnerWidth(width);
-  const shown = ansiSafeSlice(label, Math.max(1, inner - 5));
-  const fill = Math.max(0, inner - 5 - visibleLength(shown));
-  const left = theme.fg("border", `${cornerL}${h}${h}${h} `);
-  const right = theme.fg("border", `${h.repeat(fill)}${cornerR}`);
-  return `${left}${shown} ${right}`;
-}
-
-const LANG_ICON = "\u{E86C}";
 
 /** Tool label: the card's fallback title and the tool's registered `label`. */
 export const TOOL_LABEL = "PowerShell 7";
 
 /**
- * Titled bar text: accent icon + bright title.
+ * A leading home directory shortened to `~`, separators normalized — the form
+ * the host's own tool cards give a path outside the project.
+ */
+function shortenHome(target: string): string {
+  const home = os.homedir();
+  if (!home || home.length <= 1) return target;
+  const windowsStyle = /^[A-Za-z]:[\\/]/.test(home) || home.startsWith("\\\\");
+  // A trailing separator (`C:\Users\me\`, `/home/me/`) must still match
+  // `<home>/child`; roots such as `/` and `C:\` keep theirs.
+  const trimmed = home.replace(/(?<=[^\\/:])[\\/]+$/, "");
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const leading = new RegExp(`^${escaped}(?=$|[\\\\/])`, windowsStyle ? "i" : "");
+  const match = leading.exec(target);
+  if (!match) return target;
+  const suffix = target.slice(match[0].length);
+  return `~${suffix.replaceAll(path.win32.sep, path.posix.sep)}`;
+}
+
+/**
+ * A working directory as the card's title shows it, the rule the built-in
+ * tool cards use: nothing when it resolves to the session directory, a
+ * relative path inside the project, a `~`-shortened absolute one outside.
+ *
+ * Local because the host's `formatToolWorkingDirectory` (and the pi-tui module
+ * that carried it) is gone in 19.2; the rule is the same one
+ * `ui/tools/run.tsx` uses for its own cards.
+ */
+export function formatWorkingDirectory(
+  workdir: string | undefined,
+  projectDir: string,
+): string | undefined {
+  if (!workdir) return undefined;
+  const root = path.resolve(projectDir);
+  const resolved = path.resolve(projectDir, workdir);
+  if (resolved === root) return undefined;
+  const relative = path.relative(root, resolved);
+  // On Windows, `path.relative` across drives returns the absolute target,
+  // which is not inside the project.
+  const inside =
+    relative.length > 0 &&
+    !path.isAbsolute(relative) &&
+    !relative.startsWith("..");
+  return replaceTabs(inside ? relative : shortenHome(resolved));
+}
+
+/** Icon ahead of a card's title: the theme's PowerShell icon. */
+function titleIcon(theme: Theme): string {
+  return (
+    theme.symbols?.langIcon?.("powershell") ||
+    theme.symbols?.symbol("lang.shell") ||
+    "⌘"
+  );
+}
+
+/**
+ * The card's title row: accent icon + bright title, plus the working directory
+ * the call asked for.
  *
  * The title is the model's intent, not the tool name, and `cwd` is only shown
  * when the call asked for one — the session cwd is implied, and printing it on
  * every card both repeats itself and eats the header's width budget.
  */
-function frameTitle(theme: Theme, label: string, cwd?: string): string {
+function titleRow(theme: Theme, label: string, cwd?: string): string {
   const safeLabel = sanitizeTerminalText(label);
   const safeCwd = cwd ? sanitizeTerminalText(cwd) : "";
-  const body = ` ${safeLabel}${safeCwd ? ` · ${safeCwd}` : ""}`;
-  return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
+  const body = `${safeLabel}${safeCwd ? `${dot(theme)}${safeCwd}` : ""}`;
+  return `${theme.fg("accent", titleIcon(theme))} ${theme.fg("toolTitle", body)}`;
 }
 
 /**
  * One-line, control-free form of a model-authored intent.
  *
  * Whitespace runs collapse to one space: a newline inside a rendered row splits
- * the frame in the terminal. Control sequences are stripped because `i` and
+ * the card in the terminal. Control sequences are stripped because `i` and
  * `jobId` are model-authored, so a raw ESC here reaches the terminal unfiltered
  * (see `sanitizeTerminalText`).
  */
@@ -298,16 +192,12 @@ function callLabel(args: {
 /**
  * Intent seen for one call, keyed by its args object.
  *
- * Never keyed by the host's render-state object: an extension tool's hooks go
- * through `RegisteredToolAdapter`, which hands `renderCall` a fresh Proxy of the
- * render state and `renderResult` a fresh `{expanded,isPartial,spinnerFrame}`
- * literal (`extensibility/extensions/wrapper.ts`), so that object identifies
- * nothing across the two hooks. The args reference survives the adapter, and
- * `tool_execution_start` hands the extension the very same object the renderers
- * later receive (`agent-loop.ts`: `stream.push({args: effectiveArgs})` is the
- * object `#getCallArgsForRender`/`renderResult` see) — which is what makes the
- * intent recoverable after intent tracing stripped `i` out of the parameters
- * (`extractIntent` -> `effectiveArgs`).
+ * The host hands `renderResult` the live args object, so a card built there can
+ * still read an intent the streamed arguments carried (intent tracing strips `i`
+ * from the parameters `execute` sees, not from the object the renderers get).
+ * `renderCall` is handed a clone, which this map misses on purpose — the clone
+ * keeps `i` itself, and `tool_execution_start` covers the case where it does
+ * not (see `intentsByCallId` in `pwsh-tool.ts`).
  */
 const intentsByArgs = new WeakMap<object, string>();
 
@@ -338,31 +228,13 @@ export function callTitle(
 }
 
 /**
- * One-row pending line, drawn while the model is still emitting the arguments.
- *
- * Same shape as the host's inline tools (`grep`/`glob` render `renderStatusLine`
- * with the `pending` icon inside a `Text(text, 1, 0)`): a single row, no frame,
- * no card background. The component is marked as a framed block so the host adds
- * neither padding nor its state tint, and the leading column is ours to add —
- * exactly what `Text(..., 1, 0)` does for those built-ins.
- */
-function pendingCallRow(theme: Theme, label: string): string {
-  // `renderStatusLine({icon:"pending", titleColor:"toolTitle"})` with no
-  // description/meta, spelled out because the host's `Theme` class type is
-  // nominal (`#private`) and cannot be structurally satisfied by our duck-typed
-  // subset: same icon source, same color, same one row.
-  const icon = theme.styledSymbol?.("status.pending", "muted") ?? "⏳";
-  return `${icon} ${theme.fg("toolTitle", label)}`;
-}
-
-/**
- * Complete pending row, including the leading column the host does not add for a
- * framed component. Exported because the design preview (`dev/render-preview`,
- * kept on the `dev-preview` branch) renders this exact string instead of
- * re-assembling it: a missing prefix is one column of drift.
+ * One-row pending line, drawn while the model is still emitting the arguments:
+ * a single row, no card body, the shape the host's inline tools use — the box
+ * around it (padding, tint) is the host's job for every rows renderer.
  */
 export function renderPendingRow(theme: Theme, label: string): string {
-  return ` ${pendingCallRow(theme, sanitizeTerminalText(label))}`;
+  const icon = theme.fg("muted", statusGlyph(theme, "pending"));
+  return `${icon} ${theme.fg("toolTitle", sanitizeTerminalText(label))}`;
 }
 
 const PREVIEW_LINES_COLLAPSED = 6;
@@ -380,7 +252,7 @@ export interface PwshRenderOptions {
   /**
    * False while the model is still emitting the tool-call arguments. The host
    * reports this to `renderCall`; the card stays a one-row pending line until it
-   * flips, so a half-streamed command never draws a frame.
+   * flips, so a half-streamed command never draws a card.
    */
   argsComplete?: boolean;
 }
@@ -394,27 +266,44 @@ function jobTag(jobId: string | undefined): string {
   return ` [${sanitizeTerminalText(jobId).replace(/\s+/g, " ").trim()}]`;
 }
 
-/** Status icon + label for the divider line (exit-code aware). */
+/** Status row: icon + state, exit code, timing and job id (state-aware). */
 function renderStatusLabel(
   d: PwshDetails,
   isError: boolean,
   theme: Theme,
   isPartial = false,
 ): string {
+  const state = (name: StatusName, color: string, text: string): string =>
+    `${theme.fg(color, statusGlyph(theme, name))} ${text}`;
+  // A progress frame can arrive before the runner reported a wall time: an
+  // unknown clock reads `0.00s`, not `NaNs`.
+  const wall = Number.isFinite(d.wallTimeMs)
+    ? (d.wallTimeMs / 1000).toFixed(2)
+    : "0.00";
+  const timing = `Wall: ${wall}s | Timeout: ${d.timeoutSec}s`;
   if (d.async && d.status === "running") {
-    return `${theme.fg("accent", "●")} running${jobTag(d.jobId)}`;
+    return state("running", "accent", `running${jobTag(d.jobId)}`);
   }
   if (d.status === "killed") {
-    return `${theme.fg("error", "◼")} killed${jobTag(d.jobId)}`;
+    return state("aborted", "error", `killed${jobTag(d.jobId)}`);
+  }
+  if (d.cancelled) {
+    return state("aborted", "error", `cancelled${jobTag(d.jobId)}`);
   }
   if (isPartial || d.streaming) {
-    return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
+    return state("running", "accent", `running${dot(theme)}${timing}`);
   }
   const hasExitCode = d.exitCode != null && d.exitCode !== 0;
   const isFailed = d.status === "failed";
   const bad = isError || hasExitCode || isFailed;
-  const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";
-  const state = d.dead
+  const name: StatusName = d.dead
+    ? "error"
+    : d.timedOut
+      ? "warning"
+      : bad
+        ? "error"
+        : "success";
+  const label = d.dead
     ? "process died"
     : d.timedOut
       ? "timed out"
@@ -430,37 +319,47 @@ function renderStatusLabel(
       : bad
         ? "error"
         : "success";
-  const exitText = hasExitCode ? ` · exit ${d.exitCode}` : "";
-  return `${theme.fg(color, icon)} ${state}${exitText} · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
+  const exitText = hasExitCode ? `${dot(theme)}exit ${d.exitCode}` : "";
+  return state(name, color, `${label}${exitText}${dot(theme)}${timing}`);
 }
 
 /** Command source lines shown before collapsing behind a ctrl+o hint. */
 const COMMAND_PREVIEW_LINES = 4;
 
-/** Frame options shared by the call, result and preview card builders. */
+/** Options shared by the call, result and preview card builders. */
 export interface PwshFrameOptions {
   /** Title label: the model's intent, or the tool label when it declared none. */
   label?: string;
   /**
    * Working directory the call asked for, exactly as the model passed it. The
-   * title shows the host's `formatToolWorkingDirectory` form: nothing when it
-   * resolves to the session directory, a relative path inside the project, a
-   * shortened absolute path outside — the rule the built-in bash card uses.
+   * title shows {@link formatWorkingDirectory}'s form: nothing when it resolves
+   * to the session directory, a relative path inside the project, a shortened
+   * absolute path outside — the rule the built-in bash card uses.
    */
   cwd?: string;
-  /** `false` leaves the frame open for a merged result to follow. */
-  closed?: boolean;
   expanded?: boolean;
 }
 
+/** Wrap one (possibly ANSI-colored) line, keeping blank lines as one row. */
+function wrapLines(text: string, width: number): string[] {
+  const rows = wrap(text, Math.max(1, width));
+  return rows.length > 0 ? rows : [""];
+}
+
+/** Drop a submitted command's trailing newlines: not command lines. */
+function trimTrailingBlank(lines: string[]): string[] {
+  const out = [...lines];
+  while (out.length > 1 && out[out.length - 1]!.trim() === "") out.pop();
+  return out;
+}
+
 /**
- * Command block rows: wrapped highlighted command lines. Collapsed shows the
- * first `COMMAND_PREVIEW_LINES` source lines plus a hint for the rest;
- * expanded shows every line - multi-line scripts (here-strings, script
- * blocks) used to stop dead after line four with no indication.
- * Shared by renderCall and renderResult (pending + merged frames).
- * `closed: false` leaves the frame open (no bottom bar) so a merged
- * renderResult can follow with the status divider + output + single bottom.
+ * Command rows: the title row, then the wrapped, highlighted command lines —
+ * the first behind a dim shell prompt, continuations aligned under it.
+ * Collapsed shows the first `COMMAND_PREVIEW_LINES` source lines plus a hint
+ * for the rest; expanded shows every line — multi-line scripts (here-strings,
+ * script blocks) used to stop dead after line four with no indication.
+ * Shared by renderCall and renderResult.
  */
 export function commandBlock(
   theme: Theme,
@@ -468,48 +367,47 @@ export function commandBlock(
   command: string,
   options: PwshFrameOptions = {},
 ): string[] {
-  const { cwd, closed = true, expanded = false } = options;
-  const title = frameTitle(
-    theme,
-    options.label ?? TOOL_LABEL,
-    formatToolWorkingDirectory(cwd, process.cwd()),
-  );
-  const out: string[] = [frameTop(width, theme, title)];
+  const expanded = options.expanded === true;
+  const out: string[] = [
+    truncate(
+      titleRow(
+        theme,
+        options.label ?? TOOL_LABEL,
+        formatWorkingDirectory(options.cwd, process.cwd()),
+      ),
+      Math.max(1, width),
+    ),
+  ];
   // Sanitize before highlighting: `highlightPowerShell` output carries the
   // theme's own escape sequences, so only the raw source can be filtered.
   const source = sanitizeTerminalText(command);
-  if (source.trim().length === 0) {
-    if (closed) out.push(frameBottom(width, theme));
-    return out;
-  }
+  if (source.trim().length === 0) return out;
   let lines: string[];
   try {
-    lines = highlightPowerShell(source, theme);
+    lines = trimTrailingBlank(highlightPowerShell(source, theme));
   } catch {
-    lines = source.split("\n");
+    lines = trimTrailingBlank(source.split("\n"));
   }
-  // A trailing newline in the submitted command is not a command line.
-  while (lines.length > 1 && lines[lines.length - 1]!.trim() === "")
-    lines.pop();
   const visibleCount = expanded
     ? lines.length
     : Math.min(lines.length, COMMAND_PREVIEW_LINES);
-  const maxCommandWidth = Math.max(1, frameInnerWidth(width) - 2);
+  const prompt = theme.fg("dim", `${glyph(theme, "tool.bash", "❯")} `);
+  const indent = " ".repeat(Math.max(0, visibleWidth(prompt)));
+  const commandWidth = Math.max(1, width - visibleWidth(prompt));
   for (const line of lines.slice(0, visibleCount)) {
-    for (const wrapped of wrapAnsiLine(line, maxCommandWidth))
-      out.push(frameRow(wrapped, width, theme));
+    const rows = wrapLines(line, commandWidth);
+    out.push(`${prompt}${rows[0]}`);
+    for (const row of rows.slice(1)) out.push(`${indent}${row}`);
   }
   const hiddenLines = lines.length - visibleCount;
   if (hiddenLines > 0) {
     out.push(
-      frameRow(
+      truncate(
         theme.fg("dim", `… ${hiddenLines} more lines (ctrl+o to expand)`),
-        width,
-        theme,
+        Math.max(1, width),
       ),
     );
   }
-  if (closed) out.push(frameBottom(width, theme));
   return out;
 }
 
@@ -519,12 +417,19 @@ function renderBody(
   theme: Theme,
   width: number,
 ): string[] {
+  const bodyWidth = Math.max(1, width);
+  // The steering notice sits above the output and survives the empty-output
+  // case: the card must say why a command that is still running stopped
+  // streaming into it (bash renders the same sentence in its Output pane).
+  const noticeLines = d.steered
+    ? wrapLines(theme.fg("warning", STEERED_NOTICE), bodyWidth)
+    : [];
   // Output and error text come from the script, not from us: strip control
   // sequences before they reach the terminal. CR is one of them, which also
   // disposes of the CRLF frames pwsh emits (they would otherwise make the
   // cursor jump back to the line start and render as blank rows).
   const body = sanitizeTerminalText(d.error ?? d.output ?? "");
-  if (!body) return [];
+  if (!body) return noticeLines;
   const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
   // Out-String pads leading/trailing blank lines (CRLF frames); trim both
   // ends and collapse interior blank runs so the preview is compact.
@@ -536,12 +441,11 @@ function renderBody(
   const trimmed = raw.slice(start, end);
   const bodyLines: string[] = [];
   let prevBlank = false;
-  const maxBodyWidth = Math.max(1, frameInnerWidth(width) - 2);
   for (const line of trimmed) {
     const blank = line.trim() === "";
     if (blank && prevBlank) continue;
     prevBlank = blank;
-    bodyLines.push(...wrapAnsiLine(line, maxBodyWidth));
+    bodyLines.push(...wrapLines(line, bodyWidth));
   }
   const lines = bodyLines.slice(0, maxLines);
   if (bodyLines.length > maxLines) {
@@ -552,14 +456,13 @@ function renderBody(
       ),
     );
   }
-  return lines;
+  return [...noticeLines, ...lines];
 }
 
 /**
- * Merged result frame: command block (left open) + status divider + output
- * rows + a single bottom bar. Called by `renderResult` in `pwsh-tool.ts`, and by
- * the design preview (`dev/render-preview`, kept on the `dev-preview` branch),
- * which renders this builder instead of a copy so the mock cannot drift.
+ * The card's rows: title, command (when there is one), status, output — in the
+ * order the card has always read top to bottom. Called by `renderResult` in
+ * `pwsh-tool.ts`.
  */
 export function renderCard(
   theme: Theme,
@@ -581,53 +484,20 @@ export function renderCard(
       theme.fg("dim", "session reset; will be rebuilt on next call"),
     );
   }
-
-  const hasCommand = command.trim().length > 0;
-  const hasBody = bodyLines.length > 0;
-
-  // Case 1: No body output (e.g. async job start, silent command, or kill action)
-  // Ergonomic design: merge the status label directly into the closing bottom border!
-  // No empty space, no awkward double-border (divider immediately followed by bottom).
-  if (!hasBody) {
-    const out = commandBlock(theme, width, command, {
-      label: options.label,
-      cwd: options.cwd,
-      closed: false,
-      expanded,
-    });
-    out.push(frameBottomWithStatus(width, theme, statusText));
-    return out;
-  }
-
-  // Case 2: Has body output, but no command (e.g. inspecting job status)
-  // Ergonomic design: Top title border -> output lines -> status bottom border.
-  // No empty command row, no stacked top divider.
-  if (!hasCommand) {
-    const title = frameTitle(
-      theme,
-      options.label ?? TOOL_LABEL,
-      formatToolWorkingDirectory(options.cwd, process.cwd()),
-    );
-    const out: string[] = [frameTop(width, theme, title)];
-    for (const line of bodyLines) {
-      out.push(frameRow(line, width, theme));
-    }
-    out.push(frameBottomWithStatus(width, theme, statusText));
-    return out;
-  }
-
-  // Case 3: Classic full card (has command AND has body output)
-  // Top title border -> command rows -> status divider -> output rows -> bottom border.
+  // The status row already carries the title's identity; a call with no command
+  // (a job inspection) still gets its title, since the host draws no head for a
+  // rows renderer.
   const out = commandBlock(theme, width, command, {
     label: options.label,
     cwd: options.cwd,
-    closed: false,
     expanded,
   });
-  out.push(frameDivider(width, theme, statusText));
-  for (const line of bodyLines) {
-    out.push(frameRow(line, width, theme));
-  }
-  out.push(frameBottom(width, theme));
-  return out;
+  out.push(truncate(statusText, Math.max(1, width)));
+  out.push(...bodyLines);
+  // Bound every row by the width the host handed the renderer: wrapped content
+  // already fits, a model-authored title or status may not.
+  const max = Math.max(1, width);
+  return out.map((row) =>
+    visibleWidth(row) > max ? truncate(row, max, "") : row,
+  );
 }

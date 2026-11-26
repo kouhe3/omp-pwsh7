@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import { buildSessionKey, definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 import { getHighlighterInstance, highlightPowerShell } from "./syntax";
@@ -64,22 +63,35 @@ function makePi() {
   };
 }
 
+/** The unicode symbol preset's keys the card reads (`theme/symbols.ts`). */
+const SYMBOLS: Record<string, string> = {
+  "status.success": "✔",
+  "status.error": "✘",
+  "status.warning": "⚠",
+  "status.running": "⟳",
+  "status.aborted": "⏹",
+  "status.pending": "⏳",
+  "sep.dot": " · ",
+  "tool.bash": "❯",
+  "lang.shell": "💻",
+};
+
 const theme = {
   fg: (_color: string, text: string) => `\x1b[38;5;244m${text}\x1b[0m`,
-  boxRound: {
-    topLeft: "╭",
-    topRight: "╮",
-    bottomLeft: "╰",
-    bottomRight: "╯",
-    horizontal: "─",
-    vertical: "│",
+  symbols: {
+    symbol: (key: string) => SYMBOLS[key] ?? "",
+    langIcon: (lang: string | undefined) => (lang === "powershell" ? "💻" : ""),
   },
-  boxSharp: { teeLeft: "┤", teeRight: "├", horizontal: "─" },
 };
+
+/** Rows as the terminal reads them: every ANSI sequence stripped. */
+function plainRows(rows: readonly string[]): string[] {
+  return rows.map((row) => Bun.stripANSI(row));
+}
 
 function renderCommand(command: string, width: number): string[] {
   const tool = definePwshTool({ zod: zStub } as never);
-  // Frame assertions describe the completed-args state; the pending row is covered separately.
+  // Card assertions describe the completed-args state; the pending row is covered separately.
   return tool
     .renderCall({ command }, { argsComplete: true }, theme)
     .render(width);
@@ -88,15 +100,15 @@ function renderCommand(command: string, width: number): string[] {
 test("renders the complete long command instead of replacing its tail with an ellipsis", () => {
   const command = `Write-Output ${"x".repeat(150)}`;
   const rows = renderCommand(command, 80);
-  const commandRows = rows.slice(1, -1).map((row) =>
-    row
-      .replace(/\x1b\[[0-9;]*m/g, "")
-      .slice(2, -2)
-      .trimEnd(),
-  );
+  // Row 0 is the title; every row after it is a command row behind the 2-cell
+  // prompt gutter (`❯ ` on the first, blanks under it).
+  const commandRows = plainRows(rows.slice(1)).map((row) => row.slice(2));
 
   expect(rows.join("\n")).not.toContain("…");
-  expect(commandRows.join("")).toBe(command);
+  // Wrapping breaks at a space, so the space at a row boundary is spent on the
+  // break; every other character must still be there, in order.
+  const squash = (text: string) => text.replaceAll(" ", "");
+  expect(squash(commandRows.join(""))).toBe(squash(command));
 });
 
 test("renders multi-line here-string commands completely when expanded", () => {
@@ -940,12 +952,8 @@ test("wraps long output without replacing its tail with an ellipsis", () => {
     )
     .render(80);
   const dividerIndex = rows.findIndex((row) => row.includes("completed"));
-  const outputRows = rows.slice(dividerIndex + 1, -1).map((row) =>
-    row
-      .replace(/\x1b\[[0-9;]*m/g, "")
-      .slice(2, -2)
-      .trimEnd(),
-  );
+  // Everything under the status row is the output, unwrapped back to one line.
+  const outputRows = plainRows(rows.slice(dividerIndex + 1));
 
   expect(rows.join("\n")).not.toContain("…");
   expect(outputRows.join("")).toBe(output);
@@ -1125,6 +1133,24 @@ test("renders the default timeout while partial details are incomplete", () => {
   expect(rendered).toContain("running");
   expect(rendered).toContain("Timeout: 300s");
   expect(rendered).not.toContain("undefined");
+  // A progress frame can arrive before the runner reports a wall time.
+  expect(rendered).not.toContain("NaN");
+});
+
+test("a progress frame without a wall time reads 0.00s", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rendered = tool
+    .renderResult(
+      { details: { streaming: true } as never },
+      { expanded: false, isPartial: true },
+      theme,
+      { command: "Start-Sleep 1" },
+    )
+    .render(80)
+    .join("\n");
+
+  expect(rendered).toContain("Wall: 0.00s");
+  expect(rendered).not.toContain("NaN");
 });
 
 test("renderCall stays an inline pending row while the arguments are still streaming", () => {
@@ -1136,30 +1162,32 @@ test("renderCall stays an inline pending row while the arguments are still strea
   );
   const rows = component.render(120);
 
-  // One grep/glob-style row: the host adds no padding or state tint of its own.
+  // One grep/glob-style row; the box around it (padding, tint) is the host's.
   expect(rows).toHaveLength(1);
-  expect(rows[0]?.startsWith(" ")).toBe(true);
-  expect(isFramedBlockComponent(component)).toBe(true);
+  expect(plainRows(rows)[0]?.startsWith("⏳")).toBe(true);
   expect(rows[0]).toContain("List large files");
   expect(rows.join("\n")).not.toContain("╭");
   expect(rows.join("\n")).not.toContain("Get-Chil");
 });
 
-test("renderCall draws the frame with the model intent once args are complete", () => {
+test("renderCall draws the command rows with the model intent once args are complete", () => {
   const tool = definePwshTool({ zod: zStub } as never);
-  const rendered = tool
+  const rows = tool
     .renderCall(
       { i: "List large files", command: "Get-Date" },
       { argsComplete: true },
       theme,
     )
-    .render(120)
-    .join("\n");
+    .render(120);
+  const rendered = rows.join("\n");
 
-  expect(rendered).toContain("╭");
   expect(rendered).toContain("List large files");
+  expect(rendered).toContain("Get-Date");
+  // Body rows only: the host draws the call's box around them.
+  expect(rendered).not.toContain("╭");
+  expect(rendered).not.toContain("╰");
   expect(rendered).not.toContain("PowerShell 7");
-  // Liveness lives on the status divider (`● running`), not in the title.
+  // Liveness lives on the status row, not in the title.
   expect(rendered).not.toContain("executing…");
 });
 
@@ -1171,6 +1199,26 @@ test("renderCall falls back to the tool label when the model declared no intent"
     .join("\n");
 
   expect(rendered).toContain("PowerShell 7");
+});
+
+test("the command rows carry the theme's PowerShell syntax colors", async () => {
+  await getHighlighterInstance();
+  const tool = definePwshTool({ zod: zStub } as never);
+  // A theme that spells its color keys out, so the row shows what it painted.
+  const marked = { fg: (color: string, text: string) => `[${color}]${text}` };
+  const command = "$items = 1..10 | Where-Object { $_ -gt 5 } # filter";
+  const rows = tool
+    .renderCall({ command }, { argsComplete: true }, marked)
+    .render(120);
+  // The brackets this theme writes are visible text, so the wrapper splits the
+  // command across rows; the colors are what the assertion is after.
+  const commandRows = rows.slice(1).join("");
+
+  // Shiki's scopes reach the row through `theme.fg`, the card's own gutter apart.
+  expect(commandRows).toContain("[syntaxVariable]$items");
+  expect(commandRows).toContain("[syntaxFunction]Where-Object");
+  expect(commandRows).toContain("[syntaxComment]# filter");
+  expect(commandRows).toContain("[dim]");
 });
 
 test("a multi-line intent cannot split a card row", () => {
@@ -1375,15 +1423,73 @@ test("falls back to the tool label when no intent was ever declared or recorded"
   expect(merged).toContain("PowerShell 7");
 });
 
-test("the completed command frame is marked as a framed block", () => {
+test("a completed call draws body rows only, never a second box", () => {
   const tool = definePwshTool({ zod: zStub } as never);
-  const component = tool.renderCall(
-    { i: "List large files", command: "Get-Date" },
-    { argsComplete: true },
-    theme,
-  );
+  const rows = tool
+    .renderCall(
+      { i: "List large files", command: "Get-Date" },
+      { argsComplete: true },
+      theme,
+    )
+    .render(100);
+  const rendered = rows.join("\n");
 
-  expect(isFramedBlockComponent(component)).toBe(true);
+  // The host boxes every rows renderer (blank tinted row, one cell of padding,
+  // state tint), so a frame or a border glyph here would nest one box in
+  // another.
+  expect(rendered).not.toMatch(/[╭╮╰╯│├┤]/);
+  expect(plainRows(rows)[0]).toContain("List large files");
+});
+
+test("a steered call shows the backgrounded-early notice in its card", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rows = tool
+    .renderResult(
+      {
+        details: {
+          ...mergedDetails,
+          async: true,
+          jobId: "pwsh-1",
+          status: "running",
+          steered: true,
+        },
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      { command: "Start-Sleep 60" },
+    )
+    .render(100)
+    .join("\n");
+
+  expect(rows).toContain(
+    "Backgrounded early to handle an incoming message; the command keeps running.",
+  );
+  expect(rows).toContain("running");
+  expect(rows).toContain("pwsh-1");
+});
+
+test("a cancelled call is an error card, not a completed one", () => {
+  const tool = definePwshTool({ zod: zStub } as never);
+  const rows = tool
+    .renderResult(
+      {
+        details: {
+          ...mergedDetails,
+          output: "partial\n",
+          cancelled: true,
+          exitCode: null,
+        },
+        isError: true,
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      { command: "Start-Sleep 60" },
+    )
+    .render(100)
+    .join("\n");
+
+  expect(rows).toContain("cancelled");
+  expect(rows).not.toContain("completed");
 });
 
 test("an absent argsComplete flag still renders the pending row", () => {
@@ -1396,7 +1502,7 @@ test("an absent argsComplete flag still renders the pending row", () => {
   expect(rows.join("\n")).not.toContain("╭");
 });
 
-test("every frame row occupies the same number of columns", () => {
+test("no card row is wider than the width the host handed the renderer", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const payloads = [
     "plain ascii line\nsecond line\n",
@@ -1408,15 +1514,15 @@ test("every frame row occupies the same number of columns", () => {
       output,
       intent: undefined as string | undefined,
     })),
-    // A model-authored intent longer than the frame is the case that used to
-    // floor `frameTop`'s fill at 0 and push the top bar past the right corner.
+    // A model-authored intent longer than the card is the case that used to
+    // push a title bar past its right corner.
     {
       output: payloads[0]!,
       intent: "Explain why the deployment script keeps failing ".repeat(3),
     },
   ];
-  // 40 columns is narrower than the status label (`✓ completed · Wall: … |
-  // Timeout: 300s`), which is what made the divider row overflow.
+  // 40 columns is narrower than the status row (`✔ completed · Wall: … |
+  // Timeout: 300s`), which is what used to overflow it.
   for (const width of [60, 40]) {
     for (const { output, intent } of cases) {
       const rows = tool
@@ -1441,8 +1547,7 @@ test("every frame row occupies the same number of columns", () => {
         Bun.stringWidth(row, { countAnsiEscapeCodes: false }),
       );
 
-      expect(new Set(widths).size).toBe(1);
-      // No row may be wider than the box the host allocated for the component.
+      // The host pads rows to the box it draws, so only the upper bound is ours.
       expect(Math.max(...widths)).toBeLessThanOrEqual(width);
     }
   }
