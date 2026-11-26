@@ -218,6 +218,8 @@ test("steering backgrounds early and keeps the command running", async () => {
     "Backgrounded early to handle an incoming message",
   );
   expect(result.details.status).toBe("running");
+  // The card reads this to draw the same sentence bash shows in its Output pane.
+  expect(result.details.steered).toBe(true);
   const job = jobs.getJob(result.details.jobId ?? "");
   expect(job?.status).toBe("running");
 
@@ -241,6 +243,8 @@ test("a cancellation kills the command instead of backgrounding it", async () =>
   const result = await run;
 
   expect(result.text).toContain("Command cancelled");
+  expect(result.isError).toBe(true);
+  expect(result.details.cancelled).toBe(true);
   expect(seen.signal?.aborted).toBe(true);
   expect(jobs.listJobs()).toHaveLength(0);
 });
