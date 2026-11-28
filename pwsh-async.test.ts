@@ -53,14 +53,6 @@ const SYMBOLS: Record<string, string> = {
   "status.pending": "⏳",
   "sep.dot": " · ",
   "lang.shell": "💻",
-  "boxRound.topLeft": "╭",
-  "boxRound.topRight": "╮",
-  "boxRound.bottomLeft": "╰",
-  "boxRound.bottomRight": "╯",
-  "boxRound.horizontal": "─",
-  "boxRound.vertical": "│",
-  "boxSharp.teeRight": "├",
-  "boxSharp.teeLeft": "┤",
 };
 
 const theme = {
@@ -303,10 +295,9 @@ test("can inspect status and kill a running async job", async () => {
 
   expect(runningCard).toContain("running");
   expect(runningCard).toContain(jobId);
-  // The card draws its own frame; with no output the status closes it on the
-  // bottom bar.
-  expect(runningCard).toContain("╭");
-  expect(runningCard).toContain("╰");
+  // Rules only: the host band is the card's frame, so no corners or bars.
+  expect(runningCard).not.toMatch(/[╭╮╰╯│├┤]/);
+  // The labelled status rule closes the card.
   expect(runningRows[runningRows.length - 1]).toContain("running");
 
   // Verify ergonomic card rendering for killed job (Case 1 with fallback title and command context)

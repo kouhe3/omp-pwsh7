@@ -1277,9 +1277,8 @@ export function definePwshTool(pi: ExtensionAPI) {
           render: () => [renderPendingRow(theme, label)],
         } satisfies ExtensionRows;
       }
-      // A rows object is drawn inside the host's custom-tool box, which adds
-      // padding and a state tint but no border: the card draws its own frame,
-      // with the title on the top bar and the command rows inside.
+      // A rows object is drawn inside the host's custom-tool box: the title row
+      // and the command rows only, no frame of our own.
       return {
         render: (width: number) =>
           commandBlock(theme, width, args.command ?? "", {
