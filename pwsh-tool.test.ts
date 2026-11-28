@@ -72,8 +72,15 @@ const SYMBOLS: Record<string, string> = {
   "status.aborted": "⏹",
   "status.pending": "⏳",
   "sep.dot": " · ",
-  "tool.bash": "❯",
   "lang.shell": "💻",
+  "boxRound.topLeft": "╭",
+  "boxRound.topRight": "╮",
+  "boxRound.bottomLeft": "╰",
+  "boxRound.bottomRight": "╯",
+  "boxRound.horizontal": "─",
+  "boxRound.vertical": "│",
+  "boxSharp.teeRight": "├",
+  "boxSharp.teeLeft": "┤",
 };
 
 const theme = {
@@ -100,9 +107,11 @@ function renderCommand(command: string, width: number): string[] {
 test("renders the complete long command instead of replacing its tail with an ellipsis", () => {
   const command = `Write-Output ${"x".repeat(150)}`;
   const rows = renderCommand(command, 80);
-  // Row 0 is the title; every row after it is a command row behind the 2-cell
-  // prompt gutter (`❯ ` on the first, blanks under it).
-  const commandRows = plainRows(rows.slice(1)).map((row) => row.slice(2));
+  // Row 0 is the title bar and the last one the bottom bar; between them every
+  // row is `│ content (padded) │`.
+  const commandRows = plainRows(rows.slice(1, -1)).map((row) =>
+    row.slice(2, -2),
+  );
 
   expect(rows.join("\n")).not.toContain("…");
   // Wrapping breaks at a space, so the space at a row boundary is spent on the
@@ -952,8 +961,11 @@ test("wraps long output without replacing its tail with an ellipsis", () => {
     )
     .render(80);
   const dividerIndex = rows.findIndex((row) => row.includes("completed"));
-  // Everything under the status row is the output, unwrapped back to one line.
-  const outputRows = plainRows(rows.slice(dividerIndex + 1));
+  // Everything between the status divider and the bottom bar is the output,
+  // unwrapped back to one line (the frame pads short rows, so drop that).
+  const outputRows = plainRows(rows.slice(dividerIndex + 1, -1)).map((row) =>
+    row.slice(2, -2).trimEnd(),
+  );
 
   expect(rows.join("\n")).not.toContain("…");
   expect(outputRows.join("")).toBe(output);
@@ -1183,9 +1195,9 @@ test("renderCall draws the command rows with the model intent once args are comp
 
   expect(rendered).toContain("List large files");
   expect(rendered).toContain("Get-Date");
-  // Body rows only: the host draws the call's box around them.
-  expect(rendered).not.toContain("╭");
-  expect(rendered).not.toContain("╰");
+  // One closed frame, the title on its top bar and the command inside.
+  expect(plainRows(rows)[0]).toMatch(/^╭─── .*List large files/);
+  expect(plainRows(rows).at(-1)).toMatch(/^╰─+╯$/);
   expect(rendered).not.toContain("PowerShell 7");
   // Liveness lives on the status row, not in the title.
   expect(rendered).not.toContain("executing…");
@@ -1214,11 +1226,11 @@ test("the command rows carry the theme's PowerShell syntax colors", async () => 
   // command across rows; the colors are what the assertion is after.
   const commandRows = rows.slice(1).join("");
 
-  // Shiki's scopes reach the row through `theme.fg`, the card's own gutter apart.
+  // Shiki's scopes reach the row through `theme.fg`, the frame apart.
   expect(commandRows).toContain("[syntaxVariable]$items");
   expect(commandRows).toContain("[syntaxFunction]Where-Object");
   expect(commandRows).toContain("[syntaxComment]# filter");
-  expect(commandRows).toContain("[dim]");
+  expect(commandRows).toContain("[borderMuted]│");
 });
 
 test("a multi-line intent cannot split a card row", () => {
@@ -1423,7 +1435,7 @@ test("falls back to the tool label when no intent was ever declared or recorded"
   expect(merged).toContain("PowerShell 7");
 });
 
-test("a completed call draws body rows only, never a second box", () => {
+test("a completed call draws one closed frame around the title and command", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const rows = tool
     .renderCall(
@@ -1434,11 +1446,13 @@ test("a completed call draws body rows only, never a second box", () => {
     .render(100);
   const rendered = rows.join("\n");
 
-  // The host boxes every rows renderer (blank tinted row, one cell of padding,
-  // state tint), so a frame or a border glyph here would nest one box in
-  // another.
-  expect(rendered).not.toMatch(/[╭╮╰╯│├┤]/);
+  // The host tints and pads a rows renderer but draws no border, so the card
+  // draws the frame itself: closed, one box, every row inside the width.
   expect(plainRows(rows)[0]).toContain("List large files");
+  expect(rendered).toContain("╭");
+  expect(rendered).toContain("╰");
+  const widest = Math.max(...rows.map((row) => Bun.stringWidth(row)));
+  expect(widest).toBeLessThanOrEqual(100);
 });
 
 test("a steered call shows the backgrounded-early notice in its card", () => {

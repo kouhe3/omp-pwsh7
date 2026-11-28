@@ -7,11 +7,10 @@
  *
  * The render hooks return a rows object, not a component: omp boxes those rows
  * itself (one blank row above and below, one cell of padding, the call's state
- * tint) and draws no head for one, so a card here draws its own title and body
- * rows — and no frame, which would nest one box inside another. Widths and ANSI
- * handling come from the host's own text engine
- * (`@oh-my-pi/pi-tui/text/width`), the same one that measures the box the rows
- * land in.
+ * tint) but draws no border and no head, so a card here draws its own frame,
+ * title and body rows. Widths and ANSI handling come from the host's own text
+ * engine (`@oh-my-pi/pi-tui/text/width`), the same one that measures the box
+ * the rows land in.
  */
 import * as os from "node:os";
 import * as path from "node:path";
@@ -337,6 +336,8 @@ export interface PwshFrameOptions {
    * absolute path outside — the rule the built-in bash card uses.
    */
   cwd?: string;
+  /** `false` leaves the frame open for a merged result to close it. */
+  closed?: boolean;
   expanded?: boolean;
 }
 
@@ -353,9 +354,95 @@ function trimTrailingBlank(lines: string[]): string[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Frame builders: titled top bar, tee divider with the status, rows, bottom
+// bar — the card the extension drew before the rows migration, now drawn by
+// the rows renderer itself. The host boxes those rows with padding and a state
+// tint but draws no border, so without this a finished call reads as a
+// borderless block.
+// ---------------------------------------------------------------------------
+
+/** Border color: the one the host's own boxed cards use. */
+const BORDER = "borderMuted";
+
+/** Box glyph of a theme symbol key, else `fallback`. */
+function boxGlyph(theme: Theme, key: string, fallback: string): string {
+  return theme.symbols?.symbol(key) || fallback;
+}
+
 /**
- * Command rows: the title row, then the wrapped, highlighted command lines —
- * the first behind a dim shell prompt, continuations aligned under it.
+ * Inner span of the frame's horizontal bars. One column narrower than the
+ * maximum so the closing corner survives width math: box-drawing glyphs are
+ * Ambiguous-width, and some width engines count them as two columns.
+ */
+function frameInnerWidth(width: number): number {
+  return Math.max(10, width - 3);
+}
+
+/** `╭─── {title} ────────────────────╮` */
+function frameTop(theme: Theme, width: number, title: string): string {
+  const h = boxGlyph(theme, "boxRound.horizontal", "─");
+  const inner = frameInnerWidth(width);
+  // Three leader dashes, their trailing space, the space after the title and
+  // the two corners consume five columns; clamping the title (rather than
+  // letting the fill floor at 0) keeps a long, model-authored intent inside
+  // the frame it drew.
+  const shown = truncate(title, Math.max(1, inner - 5), "…");
+  const fill = Math.max(0, inner - 5 - visibleWidth(shown));
+  const cornerL = theme.fg(BORDER, boxGlyph(theme, "boxRound.topLeft", "╭"));
+  const cornerR = theme.fg(BORDER, boxGlyph(theme, "boxRound.topRight", "╮"));
+  return `${cornerL}${theme.fg(BORDER, `${h}${h}${h} `)}${shown} ${theme.fg(BORDER, `${h.repeat(fill)}${cornerR}`)}`;
+}
+
+/** `├─── {label} ────────────────────┤` */
+function frameDivider(theme: Theme, width: number, label: string): string {
+  const h = boxGlyph(theme, "boxRound.horizontal", "─");
+  const inner = frameInnerWidth(width);
+  // omp names tees from the glyph's own direction (teeRight = `├`), so the
+  // left border takes `teeRight` and the right one `teeLeft`.
+  const teeL = boxGlyph(theme, "boxSharp.teeRight", "├");
+  const teeR = boxGlyph(theme, "boxSharp.teeLeft", "┤");
+  const shown = truncate(label, Math.max(1, inner - 5), "…");
+  const fill = Math.max(0, inner - 5 - visibleWidth(shown));
+  return `${theme.fg(BORDER, `${teeL}${h}${h}${h} `)}${shown} ${theme.fg(BORDER, `${h.repeat(fill)}${teeR}`)}`;
+}
+
+/** `│ content (padded) │` — one content row inside the frame. */
+function frameRow(theme: Theme, width: number, content: string): string {
+  const room = Math.max(1, frameInnerWidth(width) - 2);
+  const shown = truncate(content, room, "");
+  const pad = Math.max(0, room - visibleWidth(shown));
+  const v = theme.fg(BORDER, boxGlyph(theme, "boxRound.vertical", "│"));
+  return `${v} ${shown}${" ".repeat(pad)} ${v}`;
+}
+
+/** `╰────────────────────────╯` */
+function frameBottom(theme: Theme, width: number): string {
+  const h = boxGlyph(theme, "boxRound.horizontal", "─");
+  const cornerL = boxGlyph(theme, "boxRound.bottomLeft", "╰");
+  const cornerR = boxGlyph(theme, "boxRound.bottomRight", "╯");
+  return theme.fg(BORDER, `${cornerL}${h.repeat(frameInnerWidth(width))}${cornerR}`);
+}
+
+/** `╰─── status ────────────────────╯` */
+function frameBottomWithStatus(
+  theme: Theme,
+  width: number,
+  label: string,
+): string {
+  const h = boxGlyph(theme, "boxRound.horizontal", "─");
+  const inner = frameInnerWidth(width);
+  const cornerL = boxGlyph(theme, "boxRound.bottomLeft", "╰");
+  const cornerR = boxGlyph(theme, "boxRound.bottomRight", "╯");
+  const shown = truncate(label, Math.max(1, inner - 5), "…");
+  const fill = Math.max(0, inner - 5 - visibleWidth(shown));
+  return `${theme.fg(BORDER, `${cornerL}${h}${h}${h} `)}${shown} ${theme.fg(BORDER, `${h.repeat(fill)}${cornerR}`)}`;
+}
+
+/**
+ * Command rows: the titled top bar, then the wrapped, highlighted command
+ * lines, then the bottom bar (`closed: false` leaves it open so a merged
+ * result can follow with its status divider, output and a single bottom).
  * Collapsed shows the first `COMMAND_PREVIEW_LINES` source lines plus a hint
  * for the rest; expanded shows every line — multi-line scripts (here-strings,
  * script blocks) used to stop dead after line four with no indication.
@@ -368,20 +455,25 @@ export function commandBlock(
   options: PwshFrameOptions = {},
 ): string[] {
   const expanded = options.expanded === true;
+  const closed = options.closed !== false;
   const out: string[] = [
-    truncate(
+    frameTop(
+      theme,
+      width,
       titleRow(
         theme,
         options.label ?? TOOL_LABEL,
         formatWorkingDirectory(options.cwd, process.cwd()),
       ),
-      Math.max(1, width),
     ),
   ];
   // Sanitize before highlighting: `highlightPowerShell` output carries the
   // theme's own escape sequences, so only the raw source can be filtered.
   const source = sanitizeTerminalText(command);
-  if (source.trim().length === 0) return out;
+  if (source.trim().length === 0) {
+    if (closed) out.push(frameBottom(theme, width));
+    return out;
+  }
   let lines: string[];
   try {
     lines = trimTrailingBlank(highlightPowerShell(source, theme));
@@ -391,23 +483,23 @@ export function commandBlock(
   const visibleCount = expanded
     ? lines.length
     : Math.min(lines.length, COMMAND_PREVIEW_LINES);
-  const prompt = theme.fg("dim", `${glyph(theme, "tool.bash", "❯")} `);
-  const indent = " ".repeat(Math.max(0, visibleWidth(prompt)));
-  const commandWidth = Math.max(1, width - visibleWidth(prompt));
+  const commandWidth = Math.max(1, frameInnerWidth(width) - 2);
   for (const line of lines.slice(0, visibleCount)) {
-    const rows = wrapLines(line, commandWidth);
-    out.push(`${prompt}${rows[0]}`);
-    for (const row of rows.slice(1)) out.push(`${indent}${row}`);
+    for (const row of wrapLines(line, commandWidth)) {
+      out.push(frameRow(theme, width, row));
+    }
   }
   const hiddenLines = lines.length - visibleCount;
   if (hiddenLines > 0) {
     out.push(
-      truncate(
+      frameRow(
+        theme,
+        width,
         theme.fg("dim", `… ${hiddenLines} more lines (ctrl+o to expand)`),
-        Math.max(1, width),
       ),
     );
   }
+  if (closed) out.push(frameBottom(theme, width));
   return out;
 }
 
@@ -417,7 +509,7 @@ function renderBody(
   theme: Theme,
   width: number,
 ): string[] {
-  const bodyWidth = Math.max(1, width);
+  const bodyWidth = Math.max(1, frameInnerWidth(width) - 2);
   // The steering notice sits above the output and survives the empty-output
   // case: the card must say why a command that is still running stopped
   // streaming into it (bash renders the same sentence in its Output pane).
@@ -460,9 +552,10 @@ function renderBody(
 }
 
 /**
- * The card's rows: title, command (when there is one), status, output — in the
- * order the card has always read top to bottom. Called by `renderResult` in
- * `pwsh-tool.ts`.
+ * The card's rows: one closed frame. The top bar carries the title, the command
+ * rows follow, then the status — as a divider when output follows it, folded
+ * into the closing bottom bar when there is none — and the output rows.
+ * Called by `renderResult` in `pwsh-tool.ts`.
  */
 export function renderCard(
   theme: Theme,
@@ -484,20 +577,51 @@ export function renderCard(
       theme.fg("dim", "session reset; will be rebuilt on next call"),
     );
   }
-  // The status row already carries the title's identity; a call with no command
-  // (a job inspection) still gets its title, since the host draws no head for a
-  // rows renderer.
+
+  const hasCommand = command.trim().length > 0;
+  const hasBody = bodyLines.length > 0;
+
+  // No output (an async job start, a silent command, a kill action): the status
+  // closes the card on its own bottom bar instead of a divider followed by an
+  // empty body and a second bar.
+  if (!hasBody) {
+    const out = commandBlock(theme, width, command, {
+      label: options.label,
+      cwd: options.cwd,
+      closed: false,
+      expanded,
+    });
+    out.push(frameBottomWithStatus(theme, width, statusText));
+    return out;
+  }
+
+  // Output but no command (a job inspection): title bar, output, status bar.
+  if (!hasCommand) {
+    const out = [
+      frameTop(
+        theme,
+        width,
+        titleRow(
+          theme,
+          options.label ?? TOOL_LABEL,
+          formatWorkingDirectory(options.cwd, process.cwd()),
+        ),
+      ),
+      ...bodyLines.map((line) => frameRow(theme, width, line)),
+      frameBottomWithStatus(theme, width, statusText),
+    ];
+    return out;
+  }
+
+  // Command and output: title bar, command rows, status divider, output, bottom.
   const out = commandBlock(theme, width, command, {
     label: options.label,
     cwd: options.cwd,
+    closed: false,
     expanded,
   });
-  out.push(truncate(statusText, Math.max(1, width)));
-  out.push(...bodyLines);
-  // Bound every row by the width the host handed the renderer: wrapped content
-  // already fits, a model-authored title or status may not.
-  const max = Math.max(1, width);
-  return out.map((row) =>
-    visibleWidth(row) > max ? truncate(row, max, "") : row,
-  );
+  out.push(frameDivider(theme, width, statusText));
+  for (const line of bodyLines) out.push(frameRow(theme, width, line));
+  out.push(frameBottom(theme, width));
+  return out;
 }
